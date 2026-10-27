@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # Zed Notebook
 
 A fork of [Zed](https://github.com/zed-industries/zed) built to give it complete Jupyter notebook support, in Zed's own style: `.ipynb` files open as native notebooks, with the same editor, language servers and agent that you use for any other file. The notebook code lives in separate crates (`notebook_lsp`, `notebook_variables`, `notebook_cell_context`, `notebook_agent_tools`) and in `crates/repl`, so the branch stays easy to rebase onto upstream.
