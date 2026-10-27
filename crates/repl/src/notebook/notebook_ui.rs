@@ -1865,8 +1865,6 @@ impl NotebookEditor {
         }
         if self.selected_cell_index < count - 1 {
             self.selected_cell_index += 1;
-            self.cell_list
-                .scroll_to_reveal_item(self.selected_cell_index);
         }
         self.notebook_mode = NotebookMode::Command;
         self.focus_handle.focus(window, cx);

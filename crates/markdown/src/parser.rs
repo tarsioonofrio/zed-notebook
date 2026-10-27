@@ -318,6 +318,8 @@ fn preprocess_math_source(source: &str) -> String {
                 bytes[dollar + 1] = b'$';
             }
             in_math = !in_math;
+        } else if trimmed == "$$" {
+            in_math = !in_math;
         } else if in_math
             && !trimmed.is_empty()
             && (trimmed.bytes().all(|byte| byte == b'=')
@@ -2289,6 +2291,23 @@ mod tests {
                 .iter()
                 .any(|(_, event)| matches!(event, InlineMath(_) | DisplayMath(_))),
             "standalone `$` must remain plain text when math is disabled"
+        );
+    }
+
+    #[test]
+    fn test_double_dollar_block_with_setext_like_lines_is_display_math() {
+        let source = "Texto\n\n$$\na\n=\nb\n-\nc\n$$\n\nFim\n";
+        let parsed = parse_markdown_with_math(source, false, false, false, true);
+        assert_eq!(
+            display_math_contents(source),
+            vec!["a\n=\nb\n-\nc".to_string()]
+        );
+        assert!(
+            !parsed
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, Start(Heading { .. }))),
+            "lone `=` and `-` lines inside `$$` must not become Setext headings"
         );
     }
 
