@@ -189,17 +189,23 @@ fn render_latex_to_svg(latex: &str, display: bool, color: Hsla) -> anyhow::Resul
 
 /// Renders a cached math expression as an image, falling back to the raw source
 /// text while the background render is pending or if it failed.
+///
+/// The formula is scaled so that one em of math matches `body_font_size`, the
+/// size of the surrounding text, instead of the fixed size it was rasterized at.
 pub(crate) fn render_math(
     state: &MathState,
     expression: &MathExpression,
     source_text: SharedString,
+    body_font_size: Pixels,
 ) -> AnyElement {
     match state
         .get(expression)
         .and_then(|cached| cached.render_image.get())
     {
         Some(Ok(render_image)) => {
+            let scale = body_font_size / math_em_size();
             let base_size = math_base_size(render_image);
+            let base_size = size(base_size.width * scale, base_size.height * scale);
             img(ImageSource::Render(render_image.clone()))
                 .w(base_size.width)
                 .h(base_size.height)
@@ -207,6 +213,12 @@ pub(crate) fn render_math(
         }
         _ => StyledText::new(source_text).into_any_element(),
     }
+}
+
+/// The on-screen size of one em of math at the rasterized [`MATH_FONT_SIZE`].
+/// `ratex-svg` declares its dimensions in `pt`, which are 4/3 of a pixel.
+fn math_em_size() -> Pixels {
+    px((MATH_FONT_SIZE * 4.0 / 3.0) as f32)
 }
 
 /// Recovers the formula's logical size from its raster.

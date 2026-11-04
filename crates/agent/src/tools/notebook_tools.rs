@@ -1,6 +1,6 @@
 use super::tool_permissions::authorize_file_edit;
 use crate::{AgentTool, Thread, ToolCallEventStream, ToolInput};
-use agent_client_protocol::schema::v2 as acp;
+use agent_client_protocol::v2::schema as acp;
 use fs::Fs;
 use gpui::{App, Entity, SharedString, Task, WeakEntity};
 use notebook_agent_tools::{LineRange, NotebookCellType, NotebookLiveCommand};

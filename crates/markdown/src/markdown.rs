@@ -135,6 +135,7 @@ pub struct MarkdownStyle {
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
     pub soft_break_as_hard_break: bool,
+    pub rounded_images: bool,
 }
 
 impl Default for MarkdownStyle {
@@ -164,6 +165,7 @@ impl Default for MarkdownStyle {
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
             soft_break_as_hard_break: false,
+            rounded_images: true,
         }
     }
 }
@@ -410,6 +412,10 @@ impl MarkdownStyle {
         });
 
         self.heading_border_color = Some(colors.border_variant);
+
+        // The preview should match how GitHub and browsers render images, which
+        // keep their own corners (e.g. shields.io badges).
+        self.rounded_images = false;
 
         self
     }
@@ -2064,7 +2070,7 @@ impl MarkdownElement {
                     .id(("markdown-image", range.start))
                     .min_w_0()
                     .max_w_full()
-                    .rounded_md()
+                    .when(self.style.rounded_images, |this| this.rounded_md())
                     .mr_1()
                     .mb_1()
                     .when_some(height, |this, height| this.h(height))
@@ -2342,8 +2348,7 @@ impl MarkdownElement {
             range,
             markdown_end,
         );
-        // Without `w_0`, text doesn't wrap to the width of the container.
-        builder.push_div(div().flex_1().w_0(), range, markdown_end);
+        builder.push_div(div().flex_1().min_w_0(), range, markdown_end);
     }
 
     fn pop_markdown_list_item(&self, builder: &mut MarkdownElementBuilder) {
@@ -3453,13 +3458,17 @@ impl Element for MarkdownElement {
                 MarkdownEvent::InlineMath(latex) => {
                     let expression = MathExpression::new(latex.clone(), false);
                     let fallback = parsed_markdown.source[range.clone()].into();
-                    let element = math::render_math(&math_state, &expression, fallback);
+                    let body_font_size = builder.text_style().font_size.to_pixels(window.rem_size());
+                    let element =
+                        math::render_math(&math_state, &expression, fallback, body_font_size);
                     builder.push_image_child(element);
                 }
                 MarkdownEvent::DisplayMath(latex) => {
                     let expression = MathExpression::new(latex.clone(), true);
                     let fallback = parsed_markdown.source[range.clone()].into();
-                    let element = math::render_math(&math_state, &expression, fallback);
+                    let body_font_size = builder.text_style().font_size.to_pixels(window.rem_size());
+                    let element =
+                        math::render_math(&math_state, &expression, fallback, body_font_size);
                     builder.push_sourced_element(
                         range.clone(),
                         div()
