@@ -1865,8 +1865,6 @@ impl NotebookEditor {
         }
         if self.selected_cell_index < count - 1 {
             self.selected_cell_index += 1;
-            self.cell_list
-                .scroll_to_reveal_item(self.selected_cell_index);
         }
         self.notebook_mode = NotebookMode::Command;
         self.focus_handle.focus(window, cx);
@@ -4036,7 +4034,7 @@ fn python_interpreter_for_spec(spec: &KernelSpecification) -> Option<PathBuf> {
 
 impl Render for NotebookEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut key_context = KeyContext::new_with_defaults();
+        let mut key_context = KeyContext::new_with_defaults(cx.platform_info().os);
         key_context.add("NotebookEditor");
         key_context.set(
             "notebook_mode",

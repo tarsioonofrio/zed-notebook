@@ -387,6 +387,15 @@ impl Render for TerminalOutput {
             .map(|advance| advance.width)
             .unwrap_or(Pixels::ZERO);
 
+        // The canvas must be as wide as its widest line, otherwise the scroll
+        // container around it has nothing to scroll past the visible width.
+        let num_columns = batched_text_runs
+            .iter()
+            .map(|batch| batch.start_point.column().max(0) as usize + batch.cell_count)
+            .max()
+            .unwrap_or(0);
+        let width = cell_width * num_columns as f32;
+
         canvas(
             // prepaint
             move |_bounds, _, _| {},
@@ -431,6 +440,7 @@ impl Render for TerminalOutput {
             },
         )
         // We must set the height explicitly for the editor block to size itself correctly
+        .w(width)
         .h(height)
         .into_any_element()
     }
