@@ -1,9 +1,8 @@
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, AppContext, Context, Hsla, ImageSource, IntoElement, Pixels, RenderImage,
-    SMOOTH_SVG_SCALE_FACTOR, SharedString, Styled, StyledText, Task, img, px, size,
+    AnyElement, AppContext, Context, Hsla, IntoElement, Pixels, SharedString, Styled, StyledText,
+    Task, TextStyle, Window, px, svg,
 };
-use theme::ActiveTheme;
 
 use ratex_layout::{LayoutOptions, layout, to_display_list, validate_layout};
 use ratex_parser::parser::parse;
@@ -18,12 +17,17 @@ use crate::{Markdown, ParsedMarkdown};
 
 /// The size of one `em` of math, in the user units of the generated SVG.
 ///
-/// `ratex-svg` emits dimensions in `pt`, which `resvg` (used by gpui's SVG
-/// renderer) resolves at 96 DPI. This value is chosen so that one `em` of math
-/// comes out close to the size of the surrounding body text once rasterized.
+/// Dimensions are expressed in these units so that a formula scales with the
+/// surrounding body text: one `em` of math is drawn at the body font size.
 const MATH_FONT_SIZE: f64 = 10.5;
 /// Padding around a formula, in the same units as [`MATH_FONT_SIZE`].
 const MATH_PADDING: f64 = 1.0;
+/// Scales formulas relative to the body text they sit in.
+const MATH_SIZE_SCALE: f32 = 1.1;
+/// Calibrated against a screenshot: inline formulas sat about 4px below the text
+/// baseline at a body size of roughly 12px, which the metric-based offset alone
+/// does not account for.
+const INLINE_BASELINE_CORRECTION_EM: f32 = 0.33;
 
 /// A single math expression, keyed in the render cache by its source and
 /// whether it is displayed as a block or inline.
@@ -42,27 +46,27 @@ impl MathExpression {
 #[derive(Clone, Default)]
 pub(crate) struct MathState {
     cache: HashMap<MathExpression, Arc<CachedMath>>,
-    /// The text color the cached rasters were rendered with. When the theme
-    /// changes, the cache is dropped so formulas are re-rendered in the new
-    /// color.
-    color: Option<Hsla>,
 }
 
 struct CachedMath {
-    render_image: Arc<OnceLock<anyhow::Result<Arc<RenderImage>>>>,
+    render: Arc<OnceLock<anyhow::Result<RenderedMath>>>,
     _task: Task<()>,
+}
+
+struct RenderedMath {
+    svg: String,
+    /// The formula's box, including padding, in [`MATH_FONT_SIZE`] units.
+    width: f64,
+    height: f64,
+    /// The distance from the top of the box to the formula's baseline, in
+    /// [`MATH_FONT_SIZE`] units.
+    ascent: f64,
 }
 
 impl MathState {
     /// Reconciles the cache against the math expressions found in `parsed`,
-    /// spawning background renders for any expression that is not cached yet.
+    /// spawning background layouts for any expression that is not cached yet.
     pub(crate) fn update(&mut self, parsed: &ParsedMarkdown, cx: &mut Context<Markdown>) {
-        let color = cx.theme().colors().text;
-        if self.color != Some(color) {
-            self.color = Some(color);
-            self.clear(cx);
-        }
-
         let mut expressions = Vec::new();
         for (_, event) in parsed.events.iter() {
             match event {
@@ -80,25 +84,17 @@ impl MathState {
             if !self.cache.contains_key(expression) {
                 self.cache.insert(
                     expression.clone(),
-                    Arc::new(CachedMath::new(expression.clone(), color, cx)),
+                    Arc::new(CachedMath::new(expression.clone(), cx)),
                 );
             }
         }
 
         let wanted: HashSet<MathExpression> = expressions.into_iter().collect();
-        self.cache.retain(|expression, cached| {
-            let keep = wanted.contains(expression);
-            if !keep {
-                cached.drop_image(cx);
-            }
-            keep
-        });
+        self.cache
+            .retain(|expression, _| wanted.contains(expression));
     }
 
-    pub(crate) fn clear(&mut self, cx: &mut App) {
-        for cached in self.cache.values() {
-            cached.drop_image(cx);
-        }
+    pub(crate) fn clear(&mut self) {
         self.cache.clear();
     }
 
@@ -108,61 +104,45 @@ impl MathState {
 }
 
 impl CachedMath {
-    fn new(expression: MathExpression, color: Hsla, cx: &mut Context<Markdown>) -> Self {
-        let render_image = Arc::new(OnceLock::<anyhow::Result<Arc<RenderImage>>>::new());
-        let svg_renderer = cx.svg_renderer();
+    fn new(expression: MathExpression, cx: &mut Context<Markdown>) -> Self {
+        let render = Arc::new(OnceLock::<anyhow::Result<RenderedMath>>::new());
 
         let task = cx.spawn({
-            let render_image = render_image.clone();
+            let render = render.clone();
             async move |this, cx| {
                 let rendered = cx
                     .background_spawn(async move {
-                        let svg = render_latex_to_svg(&expression.latex, expression.display, color)?;
-                        let tree = svg_renderer
-                            .parse_svg(svg.as_bytes())
-                            .map_err(|error| anyhow::anyhow!("{error}"))?;
-                        let image = svg_renderer
-                            .render_parsed(&tree, SMOOTH_SVG_SCALE_FACTOR)
-                            .map_err(|error| anyhow::anyhow!("{error}"))?;
-                        anyhow::Ok(image)
+                        render_latex_to_svg(&expression.latex, expression.display)
                     })
                     .await;
-                render_image.set(rendered).ok();
+                render.set(rendered).ok();
                 this.update(cx, |_, cx| cx.notify()).ok();
             }
         });
 
         Self {
-            render_image,
+            render,
             _task: task,
-        }
-    }
-
-    fn drop_image(&self, cx: &mut App) {
-        if let Some(Ok(render_image)) = self.render_image.get() {
-            cx.drop_image(render_image.clone(), None);
         }
     }
 }
 
-/// Renders a math expression to a self-contained SVG document.
+/// Lays out a math expression and renders it to a self-contained SVG document.
 ///
 /// The `embed-fonts` feature of `ratex-svg` bakes the KaTeX glyph outlines into
 /// the SVG as paths, so the result does not depend on any fonts being installed
-/// on the host. The text color is baked in as well, since the raster produced
-/// from the SVG cannot be re-tinted.
-fn render_latex_to_svg(latex: &str, display: bool, color: Hsla) -> anyhow::Result<String> {
+/// on the host. The SVG is drawn with the surrounding text color, so no color is
+/// baked into it.
+fn render_latex_to_svg(latex: &str, display: bool) -> anyhow::Result<RenderedMath> {
     let ast = parse(latex).map_err(|error| anyhow::anyhow!("failed to parse math: {error}"))?;
     let style = if display {
         MathStyle::Display
     } else {
         MathStyle::Text
     };
-    let rgba = color.to_rgb();
-    let math_color = Color::new(rgba.r, rgba.g, rgba.b, rgba.a);
     let layout_options = LayoutOptions::default()
         .with_style(style)
-        .with_color(math_color);
+        .with_color(Color::new(0.0, 0.0, 0.0, 1.0));
     let layout_box = layout(&ast, &layout_options);
     validate_layout(&layout_box)
         .map_err(|error| anyhow::anyhow!("failed to lay out math: {error}"))?;
@@ -178,72 +158,77 @@ fn render_latex_to_svg(latex: &str, display: bool, color: Hsla) -> anyhow::Resul
         embed_glyphs: true,
         font_dir: String::new(),
     };
-    let svg = render_to_svg_with_color_syntax(
-        &display_list,
-        &svg_options,
-        SvgColorSyntax::Rgba,
-    );
+    let svg = render_to_svg_with_color_syntax(&display_list, &svg_options, SvgColorSyntax::Rgba);
 
-    Ok(svg)
+    Ok(RenderedMath {
+        svg,
+        width: display_list.width * MATH_FONT_SIZE + 2.0 * MATH_PADDING,
+        height: (display_list.height + display_list.depth) * MATH_FONT_SIZE + 2.0 * MATH_PADDING,
+        ascent: display_list.height * MATH_FONT_SIZE + MATH_PADDING,
+    })
 }
 
-/// Renders a cached math expression as an image, falling back to the raw source
-/// text while the background render is pending or if it failed.
+/// The distance from the top of a text row to its baseline, for the text style
+/// the row is laid out with.
+pub(crate) fn text_baseline_offset(text_style: &TextStyle, window: &Window) -> Pixels {
+    let rem_size = window.rem_size();
+    let font_size = text_style.font_size.to_pixels(rem_size);
+    let line_height = text_style.line_height_in_pixels(rem_size);
+    let font_id = window.text_system().resolve_font(&text_style.font());
+    window
+        .text_system()
+        .baseline_offset(font_id, font_size, line_height)
+}
+
+/// Renders a cached math expression, falling back to the raw source text while
+/// the background layout is pending or if it failed.
 ///
-/// The formula is scaled so that one em of math matches `body_font_size`, the
-/// size of the surrounding text, instead of the fixed size it was rasterized at.
+/// The formula is painted as an SVG at the size it occupies on screen, so the
+/// glyphs are rasterized at the final resolution rather than scaled from a
+/// fixed-size bitmap. It takes the surrounding text color.
 pub(crate) fn render_math(
     state: &MathState,
     expression: &MathExpression,
     source_text: SharedString,
     body_font_size: Pixels,
+    text_color: Hsla,
+    text_baseline: Pixels,
 ) -> AnyElement {
-    match state
-        .get(expression)
-        .and_then(|cached| cached.render_image.get())
-    {
-        Some(Ok(render_image)) => {
-            let scale = body_font_size / math_em_size();
-            let base_size = math_base_size(render_image);
-            let base_size = size(base_size.width * scale, base_size.height * scale);
-            img(ImageSource::Render(render_image.clone()))
-                .w(base_size.width)
-                .h(base_size.height)
-                .into_any_element()
+    match state.get(expression).and_then(|cached| cached.render.get()) {
+        Some(Ok(rendered)) => {
+            let pixels_per_unit =
+                f32::from(body_font_size) / MATH_FONT_SIZE as f32 * MATH_SIZE_SCALE;
+            let formula = svg()
+                .data(rendered.svg.as_bytes())
+                .text_color(text_color)
+                .w(px(rendered.width as f32 * pixels_per_unit))
+                .h(px(rendered.height as f32 * pixels_per_unit));
+            if expression.display {
+                formula.into_any_element()
+            } else {
+                // Inline images are top-aligned in the text row, so the formula is moved
+                // until its baseline lands on the text baseline.
+                let formula_ascent = px(rendered.ascent as f32 * pixels_per_unit);
+                let correction = body_font_size * INLINE_BASELINE_CORRECTION_EM;
+                formula
+                    .relative()
+                    .top(text_baseline - formula_ascent - correction)
+                    .into_any_element()
+            }
         }
         _ => StyledText::new(source_text).into_any_element(),
     }
 }
 
-/// The on-screen size of one em of math at the rasterized [`MATH_FONT_SIZE`].
-/// `ratex-svg` declares its dimensions in `pt`, which are 4/3 of a pixel.
-fn math_em_size() -> Pixels {
-    px((MATH_FONT_SIZE * 4.0 / 3.0) as f32)
-}
-
-/// Recovers the formula's logical size from its raster.
-///
-/// Rasters from `SvgRenderer::render_parsed` are produced at
-/// [`SMOOTH_SVG_SCALE_FACTOR`] times the SVG's declared size, so dividing the
-/// device size by it recovers the declared size regardless of the display
-/// scale.
-fn math_base_size(image: &RenderImage) -> gpui::Size<Pixels> {
-    let device_size = image.size(0);
-    size(
-        px(device_size.width.0 as f32 / SMOOTH_SVG_SCALE_FACTOR),
-        px(device_size.height.0 as f32 / SMOOTH_SVG_SCALE_FACTOR),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::render_latex_to_svg;
-    use gpui::hsla;
 
     #[test]
     fn test_render_latex_to_svg_produces_path_glyphs() {
-        let svg = render_latex_to_svg(r"\frac{a}{b}", true, hsla(0.0, 0.0, 0.0, 1.0))
-            .expect("fraction should render");
+        let svg = render_latex_to_svg(r"\frac{a}{b}", true)
+            .expect("fraction should render")
+            .svg;
         assert!(svg.starts_with("<svg"), "expected an SVG document");
         assert!(svg.contains("<path"), "expected glyphs to be outlined");
         assert!(
@@ -264,8 +249,9 @@ mod tests {
             r"x \in \mathbb{R}^{3 \times 2}",
         ];
         for latex in expressions {
-            let svg = render_latex_to_svg(latex, true, hsla(0.0, 0.0, 0.0, 1.0))
-                .unwrap_or_else(|error| panic!("{latex}: {error}"));
+            let svg = render_latex_to_svg(latex, true)
+                .unwrap_or_else(|error| panic!("{latex}: {error}"))
+                .svg;
             assert!(svg.contains("<path"), "{latex}: expected outlined glyphs");
             assert!(
                 !svg.contains("<text"),

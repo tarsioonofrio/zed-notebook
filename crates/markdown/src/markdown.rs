@@ -1275,7 +1275,7 @@ impl Markdown {
             self.active_root_block = None;
             self.images_by_source_offset.clear();
             self.mermaid_state.clear(cx);
-            self.math_state.clear(cx);
+            self.math_state.clear();
             cx.notify();
             cx.refresh_windows();
             return;
@@ -1462,7 +1462,7 @@ impl Markdown {
                     let parsed_markdown = this.parsed_markdown.clone();
                     this.math_state.update(&parsed_markdown, cx);
                 } else {
-                    this.math_state.clear(cx);
+                    this.math_state.clear();
                 }
                 this.pending_parse.take();
                 if this.should_reparse {
@@ -3459,16 +3459,31 @@ impl Element for MarkdownElement {
                     let expression = MathExpression::new(latex.clone(), false);
                     let fallback = parsed_markdown.source[range.clone()].into();
                     let body_font_size = builder.text_style().font_size.to_pixels(window.rem_size());
-                    let element =
-                        math::render_math(&math_state, &expression, fallback, body_font_size);
+                    let text_style = builder.text_style();
+                    let text_baseline = math::text_baseline_offset(&text_style, window);
+                    let element = math::render_math(
+                        &math_state,
+                        &expression,
+                        fallback,
+                        body_font_size,
+                        text_style.color,
+                        text_baseline,
+                    );
                     builder.push_image_child(element);
                 }
                 MarkdownEvent::DisplayMath(latex) => {
                     let expression = MathExpression::new(latex.clone(), true);
                     let fallback = parsed_markdown.source[range.clone()].into();
                     let body_font_size = builder.text_style().font_size.to_pixels(window.rem_size());
-                    let element =
-                        math::render_math(&math_state, &expression, fallback, body_font_size);
+                    let text_style = builder.text_style();
+                    let element = math::render_math(
+                        &math_state,
+                        &expression,
+                        fallback,
+                        body_font_size,
+                        text_style.color,
+                        px(0.),
+                    );
                     builder.push_sourced_element(
                         range.clone(),
                         div()

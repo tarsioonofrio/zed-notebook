@@ -21,7 +21,9 @@ use project::{DisableAiSettings, Project};
 use workspace::OpenInTerminal;
 use runtimelib::{JupyterMessage, JupyterMessageContent};
 use settings::{NotebookCellNumbersContent, Settings as _};
-use ui::{CommonAnimationExt, ContextMenu, IconButtonShape, Tooltip, prelude::*};
+use ui::{
+    CommonAnimationExt, ContextMenu, IconButtonShape, Tooltip, prelude::*, utils::WithRemSize,
+};
 use util::ResultExt;
 use zed_actions::notebook::{InterruptKernel, ToggleCellOutput as NotebookToggleOutput};
 
@@ -1151,6 +1153,8 @@ impl Render for MarkdownCell {
         // Preview mode - show rendered markdown
 
         let style = MarkdownStyle::themed(MarkdownFont::Preview, window, cx);
+        let markdown_font_size =
+            theme_settings::ThemeSettings::get_global(cx).markdown_preview_font_size(cx);
 
         v_flex()
             .size_full()
@@ -1179,7 +1183,10 @@ impl Render for MarkdownCell {
                                 window.focus(&this.editor.focus_handle(cx), cx);
                                 cx.notify();
                             }))
-                            .child(MarkdownElement::new(self.markdown.clone(), style)),
+                            .child(
+                                WithRemSize::new(markdown_font_size)
+                                    .child(MarkdownElement::new(self.markdown.clone(), style)),
+                            ),
                     ),
             )
             .children(self.cell_position_spacer(false, window, cx))
