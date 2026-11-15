@@ -3975,6 +3975,10 @@ impl MarkdownHighlights {
 struct DivStackEntry {
     div: AnyDiv,
     line_break_mode: LineBreakMode,
+    /// Flex-wrap children that are not closed yet, because the next piece may be glued to
+    /// them (e.g. punctuation right after an inline formula) and must wrap together with them.
+    pending_flex_word: Vec<AnyElement>,
+    last_flex_piece_ends_with_whitespace: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -3984,10 +3988,21 @@ enum LineBreakMode {
 }
 
 impl DivStackEntry {
+    fn close_pending_flex_word(&mut self) {
+        if self.pending_flex_word.is_empty() {
+            return;
+        }
+        let word = mem::take(&mut self.pending_flex_word);
+        let group = div().flex().flex_row().flex_nowrap().min_w_0().children(word);
+        self.div.extend([group.into_any_element()]);
+    }
+
     fn new(div: impl Into<AnyDiv>) -> Self {
         Self {
             div: div.into(),
             line_break_mode: LineBreakMode::TextLayout,
+            pending_flex_word: Vec::new(),
+            last_flex_piece_ends_with_whitespace: true,
         }
     }
 }
@@ -4119,7 +4134,10 @@ impl MarkdownElementBuilder {
             .table
             .in_cell
             .then(|| self.table.current_cell_alignment());
-        self.modify_current_div(|el| {
+        // Set before `modify_current_div`, which flushes the text that precedes this child
+        // and needs to know that it lives in a flex-wrap row.
+        self.div_stack.last_mut().unwrap().line_break_mode = LineBreakMode::FlexWrap;
+        self.restyle_current_div(|el| {
             let el = el.flex().flex_row().flex_wrap();
             // Table cells center their content vertically and apply column alignment via a
             // column-direction container. Switching it to a row moves those axes, so the
@@ -4143,8 +4161,7 @@ impl MarkdownElementBuilder {
                 }
             }
         });
-        self.div_stack.last_mut().unwrap().line_break_mode = LineBreakMode::FlexWrap;
-        self.append_child(child.into_any_element());
+        self.push_flex_piece(child.into_any_element(), false, false);
     }
 
     fn push_line_break(&mut self, source_range: Range<usize>) {
@@ -4165,7 +4182,26 @@ impl MarkdownElementBuilder {
     }
 
     fn append_child(&mut self, child: AnyElement) {
-        self.div_stack.last_mut().unwrap().div.extend([child]);
+        let entry = self.div_stack.last_mut().unwrap();
+        entry.close_pending_flex_word();
+        entry.div.extend([child]);
+    }
+
+    /// Adds an inline piece to the current flex-wrap row. A piece that starts right after a
+    /// non-whitespace piece joins that piece's group, so the two wrap together.
+    fn push_flex_piece(
+        &mut self,
+        piece: AnyElement,
+        starts_with_whitespace: bool,
+        ends_with_whitespace: bool,
+    ) {
+        let entry = self.div_stack.last_mut().unwrap();
+        let glued = !entry.last_flex_piece_ends_with_whitespace && !starts_with_whitespace;
+        if !glued {
+            entry.close_pending_flex_word();
+        }
+        entry.pending_flex_word.push(piece);
+        entry.last_flex_piece_ends_with_whitespace = ends_with_whitespace;
     }
 
     fn uses_flex_line_breaks(&self) -> bool {
@@ -4175,6 +4211,17 @@ impl MarkdownElementBuilder {
     }
 
     fn modify_current_div(&mut self, f: impl FnOnce(AnyDiv) -> AnyDiv) {
+        self.flush_text();
+        if let Some(mut entry) = self.div_stack.pop() {
+            entry.close_pending_flex_word();
+            entry.div = f(entry.div);
+            self.div_stack.push(entry);
+        }
+    }
+
+    /// Like `modify_current_div`, but leaves the pending flex word open, because the
+    /// caller is about to add a piece that may be glued to it.
+    fn restyle_current_div(&mut self, f: impl FnOnce(AnyDiv) -> AnyDiv) {
         self.flush_text();
         if let Some(mut entry) = self.div_stack.pop() {
             entry.div = f(entry.div);
@@ -4213,7 +4260,9 @@ impl MarkdownElementBuilder {
 
     fn pop_div(&mut self) {
         self.flush_text();
-        let div = self.div_stack.pop().unwrap().div.into_any_element();
+        let mut entry = self.div_stack.pop().unwrap();
+        entry.close_pending_flex_word();
+        let div = entry.div.into_any_element();
         self.append_child(div);
     }
 
@@ -4436,13 +4485,50 @@ impl MarkdownElementBuilder {
         if line.text.is_empty() {
             return;
         }
+        let source_end = self.current_source_index;
 
+        if !self.uses_flex_line_breaks() {
+            let element = self.rendered_line_element(line, source_end, text_align);
+            self.append_child(element);
+            return;
+        }
+
+        // In a flex-wrap row each piece is a flex item, so pieces are split at word
+        // boundaries; otherwise a long piece would move to the next line as a whole.
+        let segments = flex_text_segments(&line.text);
+        for (index, segment) in segments.iter().enumerate() {
+            let piece_source_end = match segments.get(index + 1) {
+                Some(next) => source_index_for_rendered(&line.source_mappings, next.start)
+                    .unwrap_or(source_end),
+                None => source_end,
+            };
+            let text = &line.text[segment.clone()];
+            let starts_with_whitespace = text.starts_with(char::is_whitespace);
+            let ends_with_whitespace = text.ends_with(char::is_whitespace);
+            let piece = slice_pending_line(&line, segment.clone());
+            let element = self.rendered_line_element(piece, piece_source_end, text_align);
+            // The piece is a flex item whose automatic minimum width is its unwrapped width,
+            // so it would never shrink to the row and would run past the column.
+            self.push_flex_piece(
+                div().min_w_0().child(element).into_any_element(),
+                starts_with_whitespace,
+                ends_with_whitespace,
+            );
+        }
+    }
+
+    fn rendered_line_element(
+        &mut self,
+        line: PendingLine,
+        source_end: usize,
+        text_align: TextAlign,
+    ) -> AnyElement {
         let highlights = line
             .source_mappings
             .first()
             .map(|first_mapping| {
                 self.highlights
-                    .highlights_for_line(first_mapping.source_index..self.current_source_index)
+                    .highlights_for_line(first_mapping.source_index..source_end)
             })
             .unwrap_or_default();
         let text = StyledText::new(line.text).with_runs(line.runs);
@@ -4450,7 +4536,7 @@ impl MarkdownElementBuilder {
             layout: text.layout().clone(),
             visible_bounds: Cell::new(None),
             source_mappings: line.source_mappings,
-            source_end: self.current_source_index,
+            source_end,
             language: self
                 .code_block_stack
                 .last()
@@ -4461,18 +4547,19 @@ impl MarkdownElementBuilder {
             code_chips: line.code_chips.into_iter().collect(),
         });
         self.rendered_lines.push(rendered_line.clone());
-        self.append_child(
-            RenderedLineElement {
-                text,
-                line: rendered_line,
-            }
-            .into_any_element(),
-        );
+        RenderedLineElement {
+            text,
+            line: rendered_line,
+        }
+        .into_any_element()
     }
 
     fn build(mut self) -> RenderedMarkdown {
         debug_assert_eq!(self.div_stack.len(), 1);
         self.flush_text();
+        if let Some(entry) = self.div_stack.last_mut() {
+            entry.close_pending_flex_word();
+        }
         RenderedMarkdown {
             element: self.div_stack.pop().unwrap().div.into_any_element(),
             text: RenderedText {
@@ -4930,6 +5017,85 @@ fn source_index_for_rendered(mappings: &[SourceMapping], rendered_index: usize) 
         }
     }
     last.map(|m| m.source_index + (rendered_index - m.rendered_index))
+}
+
+/// Splits text into segments that each end with the whitespace that follows a word, and
+/// keep a leading whitespace run as its own segment.
+fn flex_text_segments(text: &str) -> Vec<Range<usize>> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut previous_was_whitespace = false;
+    for (index, character) in text.char_indices() {
+        if previous_was_whitespace && !character.is_whitespace() && index > start {
+            segments.push(start..index);
+            start = index;
+        }
+        previous_was_whitespace = character.is_whitespace();
+    }
+    if start < text.len() {
+        segments.push(start..text.len());
+    }
+    segments
+}
+
+fn slice_pending_line(line: &PendingLine, range: Range<usize>) -> PendingLine {
+    let text = line.text[range.clone()].to_string();
+
+    let mut runs = Vec::new();
+    let mut run_start = 0;
+    for run in &line.runs {
+        let run_end = run_start + run.len;
+        let start = run_start.max(range.start);
+        let end = run_end.min(range.end);
+        if start < end {
+            runs.push(TextRun {
+                len: end - start,
+                ..run.clone()
+            });
+        }
+        run_start = run_end;
+    }
+
+    let mut source_mappings = Vec::new();
+    if !line
+        .source_mappings
+        .iter()
+        .any(|mapping| mapping.rendered_index == range.start)
+        && let Some(source_index) = source_index_for_rendered(&line.source_mappings, range.start)
+    {
+        source_mappings.push(SourceMapping {
+            rendered_index: 0,
+            source_index,
+        });
+    }
+    source_mappings.extend(
+        line.source_mappings
+            .iter()
+            .filter(|mapping| {
+                mapping.rendered_index >= range.start && mapping.rendered_index < range.end
+            })
+            .map(|mapping| SourceMapping {
+                rendered_index: mapping.rendered_index - range.start,
+                source_index: mapping.source_index,
+            }),
+    );
+
+    let code_chips = line
+        .code_chips
+        .iter()
+        .filter_map(|(chip, color)| {
+            let start = chip.start.max(range.start);
+            let end = chip.end.min(range.end);
+            (start < end).then(|| ((start - range.start)..(end - range.start), *color))
+        })
+        .collect();
+
+    PendingLine {
+        text,
+        runs,
+        source_mappings,
+        code_chips,
+    }
 }
 
 pub struct RenderedMarkdown {
@@ -6699,6 +6865,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[gpui::test]
+    fn test_paragraph_with_inline_math_wraps_within_available_width(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let source = "Modelo autoregressivo é um modelo que gera sequências usando as próprias \
+            saídas anteriores como entrada, onde $y_t$ é uma função dos $y$ anteriores e cada \
+            passo depende de todo o prefixo gerado até aqui.";
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                source.into(),
+                None,
+                None,
+                MarkdownOptions {
+                    render_math: true,
+                    ..MarkdownOptions::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let width = px(300.);
+        let rendered = render_markdown_entity_in_view(
+            markdown,
+            MarkdownStyle::default(),
+            None,
+            Some(width),
+            cx,
+        );
+        assert!(rendered.lines.len() > 1, "paragraph should wrap onto several lines");
+        for (index, line) in rendered.lines.iter().enumerate() {
+            let bounds = line.layout.bounds();
+            assert!(
+                bounds.right() <= width,
+                "line {index} ends at {:?} which is past the available width of {width:?}",
+                bounds.right()
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_punctuation_after_inline_math_does_not_start_a_line(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let source = "Treino (teacher forcing): a sequência inteira entra de uma vez e a saída \
+            da posição $i$, deve prever o token $i+1$. Perda = cross-entropy somada sobre \
+            todas as posições.";
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                source.into(),
+                None,
+                None,
+                MarkdownOptions {
+                    render_math: true,
+                    ..MarkdownOptions::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let rendered = render_markdown_entity_in_view(
+            markdown,
+            MarkdownStyle::default(),
+            None,
+            Some(px(300.)),
+            cx,
+        );
+        let mut punctuation_pieces = 0;
+        for line in rendered.lines.iter() {
+            let text = line.layout.text();
+            if text.starts_with(',') || text.starts_with('.') {
+                punctuation_pieces += 1;
+                let bounds = line.layout.bounds();
+                assert!(
+                    bounds.left() > px(0.),
+                    "punctuation {text:?} starts a row at {:?}",
+                    bounds.origin
+                );
+            }
+        }
+        assert!(punctuation_pieces > 0, "expected punctuation pieces after formulas");
     }
 
     #[gpui::test]
