@@ -7098,6 +7098,7 @@ See [Agent Panel](#agent-panel) for width, flexible sizing, and Threads Sidebar 
 | `cancel_generation_on_terminal_stop`   | `true`                                          | Cancel generation when clicking the terminal tool's Stop button.                                      |
 | `use_modifier_to_send`                 | `false`                                         | Require the platform's primary modifier with Enter to send messages.                                  |
 | `message_editor_min_lines`             | `4`                                             | Minimum message-editor height in lines.                                                               |
+| `message_editor_max_lines`             | `8`                                             | Maximum message-editor height in lines before it scrolls. Raised to `message_editor_min_lines` if lower. |
 | `show_turn_stats`                      | `false`                                         | Show generation time and completed-turn duration.                                                     |
 | `show_merge_conflict_indicator`        | `true`                                          | Show the status-bar merge-conflict indicator for agent-assisted resolution.                           |
 

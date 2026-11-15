@@ -385,6 +385,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: 4
     pub message_editor_min_lines: Option<usize>,
+    /// Maximum number of lines of height the agent message editor grows to before it scrolls.
+    /// Values below `message_editor_min_lines` are raised to it.
+    ///
+    /// Default: 8
+    pub message_editor_max_lines: Option<usize>,
     /// Whether to show turn statistics (elapsed time during generation, final turn duration).
     ///
     /// Default: false

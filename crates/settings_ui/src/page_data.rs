@@ -9547,6 +9547,29 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Message Editor Max Lines",
+                description: "Maximum number of lines to display in the agent message editor before it scrolls.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.message_editor_max_lines"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .message_editor_max_lines
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .message_editor_max_lines = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Show Turn Stats",
                 description: "Whether to show turn statistics like elapsed time during generation and final turn duration.",
                 field: Box::new(SettingField {
