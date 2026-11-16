@@ -3279,9 +3279,9 @@ impl NotebookEditor {
                                         "Show variables panel"
                                     })(window, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(ToggleVariablesPanel), cx);
-                                }),
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_variables_panel(cx);
+                                })),
                             )
                             .child(
                                 PopoverMenu::new("notebook-more-menu")
