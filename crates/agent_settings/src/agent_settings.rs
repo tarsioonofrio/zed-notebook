@@ -246,6 +246,7 @@ pub struct AgentSettings {
     pub cancel_generation_on_terminal_stop: bool,
     pub use_modifier_to_send: bool,
     pub message_editor_min_lines: usize,
+    pub message_editor_max_lines: usize,
     pub show_turn_stats: bool,
     pub show_merge_conflict_indicator: bool,
     pub auto_generate_thread_titles: bool,
@@ -291,7 +292,7 @@ impl AgentSettings {
     }
 
     pub fn set_message_editor_max_lines(&self) -> usize {
-        self.message_editor_min_lines * 2
+        self.message_editor_max_lines.max(self.message_editor_min_lines)
     }
 
     pub fn favorite_model_ids(&self) -> HashSet<SharedString> {
@@ -843,6 +844,7 @@ impl Settings for AgentSettings {
             cancel_generation_on_terminal_stop: agent.cancel_generation_on_terminal_stop.unwrap(),
             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
+            message_editor_max_lines: agent.message_editor_max_lines.unwrap(),
             show_turn_stats: agent.show_turn_stats.unwrap(),
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             auto_generate_thread_titles: agent.auto_generate_thread_titles.unwrap(),

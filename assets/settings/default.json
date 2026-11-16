@@ -1423,6 +1423,10 @@
     //
     // Default: 4
     "message_editor_min_lines": 4,
+    // Maximum number of lines to display in the agent message editor before it scrolls.
+    //
+    // Default: 8
+    "message_editor_max_lines": 8,
     // Whether to show turn statistics (elapsed time during generation, final turn duration).
     //
     // Default: false
