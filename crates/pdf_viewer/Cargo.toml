@@ -1,0 +1,20 @@
+[package]
+name = "pdf_viewer"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/pdf_viewer.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+image.workspace = true
+pdfium-render.workspace = true
+smallvec.workspace = true
