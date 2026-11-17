@@ -28,7 +28,7 @@ pub use crate::schema::{
 };
 use crate::settings::adjust_buffer_font_size;
 pub use crate::settings::{
-    AgentBufferFontSize, AgentUiFontSize, BufferLineHeight, FontFamilyName,
+    AgentBufferFontSize, AgentUiFontSize, BufferLineHeight, DEFAULT_MATH_SCALE, FontFamilyName,
     GitCommitBufferFontSize, IconThemeName, IconThemeSelection, MarkdownPreviewFontSize,
     ThemeAppearanceMode, ThemeName, ThemeSelection, ThemeSettings, adjust_agent_buffer_font_size,
     adjust_agent_ui_font_size, adjust_git_commit_buffer_font_size,

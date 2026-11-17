@@ -1043,7 +1043,7 @@ pub struct JupyterContent {
 
     /// Where to show the notebook variables panel.
     ///
-    /// Default: right
+    /// Default: hidden
     pub notebook_variables_panel: Option<NotebookVariablesPanelContent>,
 }
 
@@ -1064,11 +1064,11 @@ pub struct JupyterContent {
 #[serde(rename_all = "snake_case")]
 pub enum NotebookVariablesPanelContent {
     /// Show the variables panel to the right of the notebook.
-    #[default]
     Right,
     /// Show the variables panel below the notebook.
     Bottom,
     /// Hide the variables panel.
+    #[default]
     Hidden,
 }
 

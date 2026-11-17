@@ -3279,9 +3279,9 @@ impl NotebookEditor {
                                         "Show variables panel"
                                     })(window, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(ToggleVariablesPanel), cx);
-                                }),
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_variables_panel(cx);
+                                })),
                             )
                             .child(
                                 PopoverMenu::new("notebook-more-menu")
@@ -7560,7 +7560,14 @@ mod tests {
         use futures::StreamExt as _;
 
         let (editor, cx, mut request_rx) =
-            open_notebook_editor_with_fake_kernel(cx, NOTEBOOK_WITH_ONE_CODE_CELL, |_| {}).await;
+            open_notebook_editor_with_fake_kernel(cx, NOTEBOOK_WITH_ONE_CODE_CELL, |settings| {
+                settings
+                    .editor
+                    .jupyter
+                    .get_or_insert_default()
+                    .notebook_variables_panel = Some(settings::NotebookVariablesPanelContent::Right);
+            })
+            .await;
 
         editor.update(cx, |editor, cx| editor.refresh_variables(cx));
 

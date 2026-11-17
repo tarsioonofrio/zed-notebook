@@ -1366,6 +1366,11 @@ pub struct MarkdownPreviewSettingsContent {
     ///
     /// Default: 600
     pub heading_font_weight: Option<FontWeightContent>,
+    /// Size of LaTeX formulas relative to the surrounding text in the markdown preview
+    /// and in rendered Markdown cells in notebooks. `1.0` matches the text size.
+    ///
+    /// Default: 1.1
+    pub math_scale: Option<f32>,
     /// Whether to automatically open Markdown files in the preview.
     ///
     /// Default: false

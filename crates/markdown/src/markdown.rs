@@ -126,6 +126,8 @@ pub struct MarkdownStyle {
     pub heading_level_styles: Option<HeadingLevelStyles>,
     pub heading_border_color: Option<Hsla>,
     pub paragraph_spacing: Pixels,
+    /// Size of LaTeX formulas relative to the surrounding text.
+    pub math_scale: f32,
     pub paragraph_line_height: DefiniteLength,
     /// Bottom margin of top-level lists only
     pub list_spacing: Pixels,
@@ -158,6 +160,7 @@ impl Default for MarkdownStyle {
             heading_level_styles: None,
             heading_border_color: None,
             paragraph_spacing: px(8.),
+            math_scale: theme_settings::DEFAULT_MATH_SCALE,
             paragraph_line_height: rems(1.3).into(),
             list_spacing: px(0.),
             table_cell_padding: point(px(4.), px(2.)),
@@ -343,6 +346,10 @@ impl MarkdownStyle {
         };
 
         if is_preview {
+            let style = MarkdownStyle {
+                math_scale: theme_settings.markdown_preview_math_scale(),
+                ..style
+            };
             style.with_preview_overrides(
                 colors,
                 theme_settings.markdown_preview_heading_font_weight(),
@@ -3467,6 +3474,7 @@ impl Element for MarkdownElement {
                         body_font_size,
                         text_style.color,
                         text_baseline,
+                        self.style.math_scale,
                     );
                     builder.push_image_child(element);
                 }
@@ -3482,6 +3490,7 @@ impl Element for MarkdownElement {
                         body_font_size,
                         text_style.color,
                         px(0.),
+                        self.style.math_scale,
                     );
                     builder.push_sourced_element(
                         range.clone(),
