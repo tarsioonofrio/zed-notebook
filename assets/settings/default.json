@@ -2885,7 +2885,7 @@
     "notebook_cell_numbers": "both",
     // Where to show the notebook variables panel.
     // One of "right", "bottom", or "hidden".
-    "notebook_variables_panel": "right",
+    "notebook_variables_panel": "hidden",
     // Specify the language name as the key and the kernel name as the value.
     // "kernel_selections": {
     //    "python": "conda-base"

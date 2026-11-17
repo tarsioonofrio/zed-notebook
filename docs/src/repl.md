@@ -200,7 +200,7 @@ The available values are:
 
 ### Notebook Variables Panel
 
-The variables panel shows the user variables defined in a Python kernel. Configure where it appears with `jupyter.notebook_variables_panel`:
+The variables panel shows the user variables defined in a Python kernel. It is hidden by default. Configure where it appears with `jupyter.notebook_variables_panel` (`"right"`, `"bottom"`, or `"hidden"`):
 
 ```json [settings]
 {
