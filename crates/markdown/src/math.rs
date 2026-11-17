@@ -22,8 +22,6 @@ use crate::{Markdown, ParsedMarkdown};
 const MATH_FONT_SIZE: f64 = 10.5;
 /// Padding around a formula, in the same units as [`MATH_FONT_SIZE`].
 const MATH_PADDING: f64 = 1.0;
-/// Scales formulas relative to the body text they sit in.
-const MATH_SIZE_SCALE: f32 = 1.1;
 /// Calibrated against a screenshot: inline formulas sat about 4px below the text
 /// baseline at a body size of roughly 12px, which the metric-based offset alone
 /// does not account for.
@@ -193,11 +191,11 @@ pub(crate) fn render_math(
     body_font_size: Pixels,
     text_color: Hsla,
     text_baseline: Pixels,
+    math_scale: f32,
 ) -> AnyElement {
     match state.get(expression).and_then(|cached| cached.render.get()) {
         Some(Ok(rendered)) => {
-            let pixels_per_unit =
-                f32::from(body_font_size) / MATH_FONT_SIZE as f32 * MATH_SIZE_SCALE;
+            let pixels_per_unit = f32::from(body_font_size) / MATH_FONT_SIZE as f32 * math_scale;
             let formula = svg()
                 .data(rendered.svg.as_bytes())
                 .text_color(text_color)

@@ -18,6 +18,8 @@ use theme::{Appearance, DEFAULT_ICON_THEME_NAME, SyntaxTheme, Theme, UiDensity};
 const MIN_FONT_SIZE: Pixels = px(6.0);
 const MAX_FONT_SIZE: Pixels = px(100.0);
 const MIN_LINE_HEIGHT: f32 = 1.0;
+/// The default size of LaTeX formulas relative to the surrounding text.
+pub const DEFAULT_MATH_SCALE: f32 = 1.1;
 
 pub(crate) fn ui_density_from_settings(val: settings::UiDensity) -> UiDensity {
     match val {
@@ -80,6 +82,8 @@ pub struct ThemeSettings {
     mermaid_font_family: Option<SharedString>,
     /// The font weight for headings in the markdown preview.
     markdown_preview_heading_font_weight: FontWeight,
+    /// The size of LaTeX formulas relative to the text in the markdown preview.
+    markdown_preview_math_scale: f32,
     /// The line height for buffers, and the terminal.
     ///
     /// Changing this may affect the spacing of some UI elements.
@@ -460,6 +464,11 @@ impl ThemeSettings {
         self.markdown_preview_heading_font_weight
     }
 
+    /// Returns the size of LaTeX formulas relative to the markdown preview text.
+    pub fn markdown_preview_math_scale(&self) -> f32 {
+        self.markdown_preview_math_scale
+    }
+
     /// Returns the markdown preview font size.
     ///
     /// Note: the fallback deliberately uses `self.ui_font_size` instead of `ui_font_size(cx)`,
@@ -782,6 +791,9 @@ impl settings::Settings for ThemeSettings {
                 .and_then(|preview| preview.heading_font_weight)
                 .map(|weight| weight.into_gpui())
                 .unwrap_or(FontWeight::SEMIBOLD),
+            markdown_preview_math_scale: markdown_preview
+                .and_then(|preview| preview.math_scale)
+                .unwrap_or(DEFAULT_MATH_SCALE),
             theme: theme_selection,
             experimental_theme_overrides: content.experimental_theme_overrides.clone(),
             theme_overrides: content.theme_overrides.clone(),

@@ -123,6 +123,9 @@
     "code_font_family": null,
     // The font weight for headings in the markdown preview, in CSS units from 100 to 900.
     "heading_font_weight": 600,
+    // Size of LaTeX formulas relative to the surrounding text in the markdown preview and
+    // in rendered Markdown cells in notebooks. `1.0` matches the text size.
+    "math_scale": 1.1,
     // Whether to automatically open Markdown files in the preview.
     "open_markdown_files_in_preview": false,
     // Whether to limit the width of the rendered markdown content. When
