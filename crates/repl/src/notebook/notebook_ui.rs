@@ -30,7 +30,9 @@ use notebook_lsp::{NotebookCell, NotebookLsp};
 use project::search::SearchQuery;
 use project::{Fs, Project, ProjectEntryId, ProjectPath};
 use settings::{Settings as _, SeedQuerySetting};
-use ui::{CommonAnimationExt, ContextMenu, KeyBinding, PopoverMenu, Tooltip, prelude::*};
+use ui::{
+    CommonAnimationExt, ContextMenu, KeyBinding, PopoverMenu, Tooltip, WithScrollbar, prelude::*,
+};
 use util::ResultExt as _;
 use workspace::item::{ItemEvent, SaveOptions, TabContentParams};
 use workspace::searchable::{
@@ -3459,16 +3461,21 @@ impl NotebookEditor {
             )
     }
 
-    fn cell_list(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn cell_list(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
-        list(self.cell_list.clone(), move |index, window, cx| {
-            view.update(cx, |this, cx| {
-                let cell_id = &this.cell_order[index];
-                let cell = this.cell_map.get(cell_id).unwrap();
-                this.render_cell(index, cell, window, cx).into_any_element()
-            })
-        })
-        .size_full()
+        div()
+            .size_full()
+            .child(
+                list(self.cell_list.clone(), move |index, window, cx| {
+                    view.update(cx, |this, cx| {
+                        let cell_id = &this.cell_order[index];
+                        let cell = this.cell_map.get(cell_id).unwrap();
+                        this.render_cell(index, cell, window, cx).into_any_element()
+                    })
+                })
+                .size_full(),
+            )
+            .vertical_scrollbar_for(&self.cell_list, window, cx)
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
