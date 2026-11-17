@@ -1,30 +1,52 @@
-use std::path::Path;
+mod synctex;
+
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context as _, Result};
+use editor::Editor;
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
-    IntoElement, ParentElement, Render, RenderImage, SharedString, Styled, Task, WeakEntity,
-    Window, div, img, px,
+    AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, RenderImage,
+    ScrollHandle, SharedString, Styled, Task, WeakEntity, Window, actions, div, img, point, px,
 };
 use image::{Frame, RgbaImage};
+use language::Point as TextPoint;
 use pdfium_render::prelude::*;
 use project::{Project, ProjectEntryId, ProjectPath};
 use smallvec::smallvec;
 use ui::{Button, ButtonStyle, IconButton, IconSize, Label, prelude::*};
 use workspace::{
-    Pane,
+    OpenOptions, Pane, Workspace,
     item::{Item, ItemEvent, ProjectItem as WorkspaceProjectItem, TabContentParams},
 };
 
+use crate::synctex::PdfPosition;
+
+actions!(
+    pdf_viewer,
+    [
+        /// Scrolls the PDF to the position of the cursor in the active source file.
+        ForwardSearch
+    ]
+);
+
 const PDFIUM_LIBRARY_DIRECTORY_ENV: &str = "PDFIUM_LIBRARY_DIRECTORY";
 const BASE_PAGE_WIDTH: f32 = 900.0;
+const PAGE_SPACING: f32 = 16.0;
+const REVEAL_TOP_MARGIN: f32 = 120.0;
 const ZOOM_FACTOR: f32 = 1.25;
 const MIN_ZOOM: f32 = 0.5;
 const MAX_ZOOM: f32 = 4.0;
 
 pub fn init(cx: &mut App) {
     workspace::register_project_item::<PdfView>(cx);
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action(forward_search);
+    })
+    .detach();
 }
 
 /// Loads the pdfium shared library from `directory`, which must contain the
@@ -92,14 +114,31 @@ pub fn render_page(
     Ok(Arc::new(RenderImage::new(smallvec![Frame::new(buffer)])))
 }
 
-fn render_all_pages(bytes: &[u8], target_width: i32) -> Result<Vec<Arc<RenderImage>>> {
+struct RenderedPage {
+    image: Arc<RenderImage>,
+    /// The page size in PDF points, used to map between PDF and screen coordinates.
+    width_points: f32,
+    height_points: f32,
+}
+
+fn render_all_pages(bytes: &[u8], target_width: i32) -> Result<Vec<RenderedPage>> {
     let pdfium = shared_pdfium()?;
     let document = pdfium
         .load_pdf_from_byte_slice(bytes, None)
         .context("failed to open the PDF document")?;
     let page_count = document.pages().len();
     (0..page_count)
-        .map(|page_index| render_page(&document, page_index.into(), target_width))
+        .map(|page_index| {
+            let page = document
+                .pages()
+                .get(page_index.into())
+                .context("the PDF has no page at this index")?;
+            Ok(RenderedPage {
+                image: render_page(&document, page_index.into(), target_width)?,
+                width_points: page.width().value,
+                height_points: page.height().value,
+            })
+        })
         .collect()
 }
 
@@ -111,6 +150,7 @@ fn is_pdf_path(path: &str) -> bool {
 
 pub struct PdfItem {
     project_path: ProjectPath,
+    abs_path: Option<PathBuf>,
     entry_id: Option<ProjectEntryId>,
     bytes: Arc<Vec<u8>>,
 }
@@ -126,6 +166,7 @@ impl project::ProjectItem for PdfItem {
         }
         let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
         let project_path = path.clone();
+        let abs_path = project.read(cx).absolute_path(path, cx);
         Some(cx.spawn(async move |cx| -> Result<Entity<Self>> {
             let loaded = worktree
                 .update(cx, |worktree, cx| {
@@ -134,6 +175,7 @@ impl project::ProjectItem for PdfItem {
                 .await?;
             Ok(cx.new(|_| PdfItem {
                 project_path,
+                abs_path,
                 entry_id: loaded.file.entry_id,
                 bytes: Arc::new(loaded.content),
             }))
@@ -155,7 +197,7 @@ impl project::ProjectItem for PdfItem {
 
 enum PagesState {
     Loading,
-    Rendered(Vec<Arc<RenderImage>>),
+    Rendered(Vec<RenderedPage>),
     Failed(SharedString),
 }
 
@@ -164,6 +206,9 @@ pub struct PdfView {
     focus_handle: FocusHandle,
     pages: PagesState,
     zoom: f32,
+    scroll_handle: ScrollHandle,
+    page_bounds: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+    pending_reveal: Option<PdfPosition>,
     _render_task: Task<()>,
 }
 
@@ -174,6 +219,9 @@ impl PdfView {
             focus_handle: cx.focus_handle(),
             pages: PagesState::Loading,
             zoom: 1.0,
+            scroll_handle: ScrollHandle::new(),
+            page_bounds: Rc::new(RefCell::new(Vec::new())),
+            pending_reveal: None,
             _render_task: Task::ready(()),
         };
         view.render_pages(cx);
@@ -192,6 +240,7 @@ impl PdfView {
                     Ok(pages) => PagesState::Rendered(pages),
                     Err(error) => PagesState::Failed(format!("{error:#}").into()),
                 };
+                this.apply_pending_reveal(cx);
                 cx.notify();
             })
             .ok();
@@ -206,6 +255,93 @@ impl PdfView {
         self.zoom = zoom;
         self.render_pages(cx);
         cx.notify();
+    }
+
+    fn display_width(&self) -> f32 {
+        BASE_PAGE_WIDTH * self.zoom
+    }
+
+    /// Scrolls to `position` once the pages are rendered, so a request made while
+    /// the document is still loading is not lost.
+    fn reveal(&mut self, position: PdfPosition, cx: &mut Context<Self>) {
+        self.pending_reveal = Some(position);
+        self.apply_pending_reveal(cx);
+    }
+
+    fn apply_pending_reveal(&mut self, cx: &mut Context<Self>) {
+        let PagesState::Rendered(pages) = &self.pages else {
+            return;
+        };
+        let Some(position) = self.pending_reveal else {
+            return;
+        };
+        let display_width = self.display_width();
+        let mut page_top = PAGE_SPACING;
+        for (index, page) in pages.iter().enumerate() {
+            let page_height = display_width * page.height_points / page.width_points;
+            if index + 1 == position.page as usize {
+                let y = page_top + position.y * display_width / page.width_points;
+                self.scroll_handle
+                    .set_offset(point(px(0.), px(-(y - REVEAL_TOP_MARGIN).max(0.))));
+                self.pending_reveal = None;
+                cx.notify();
+                return;
+            }
+            page_top += page_height + PAGE_SPACING;
+        }
+        self.pending_reveal = None;
+    }
+
+    fn inverse_search(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let page_bounds = self.page_bounds.borrow();
+        let Some((index, bounds)) = page_bounds
+            .iter()
+            .enumerate()
+            .find(|(_, bounds)| bounds.contains(&position))
+        else {
+            return;
+        };
+        let PagesState::Rendered(pages) = &self.pages else {
+            return;
+        };
+        let Some(page) = pages.get(index) else {
+            return;
+        };
+        let scale = f32::from(bounds.size.width) / page.width_points;
+        let x = f32::from(position.x - bounds.origin.x) / scale;
+        let y = f32::from(position.y - bounds.origin.y) / scale;
+        let Some(pdf_path) = self.pdf_item.read(cx).abs_path.clone() else {
+            return;
+        };
+        let Some(workspace) = Workspace::for_window(window, cx) else {
+            return;
+        };
+        let pdf_position = PdfPosition {
+            page: index as u32 + 1,
+            x,
+            y,
+        };
+        cx.spawn_in(window, async move |_, cx| -> Result<()> {
+            let source = cx
+                .background_spawn(async move { synctex::inverse_search(&pdf_path, pdf_position) })
+                .await?;
+            let open_task = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(source.path, OpenOptions::default(), window, cx)
+            })?;
+            let item = open_task.await?;
+            let editor = cx.update(|_, cx| item.act_as::<Editor>(cx))?;
+            if let Some(editor) = editor {
+                editor.update_in(cx, |editor, window, cx| {
+                    editor.go_to_singleton_buffer_point(
+                        TextPoint::new(source.line.saturating_sub(1), 0),
+                        window,
+                        cx,
+                    );
+                })?;
+            }
+            Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -258,22 +394,34 @@ impl Render for PdfView {
                 .color(Color::Error)
                 .into_any_element(),
             PagesState::Rendered(pages) => {
-                let display_width = BASE_PAGE_WIDTH * self.zoom;
+                let display_width = self.display_width();
+                let page_bounds = self.page_bounds.clone();
                 div()
+                    .on_children_prepainted(move |bounds, _, _| {
+                        *page_bounds.borrow_mut() = bounds;
+                    })
                     .id("pdf-pages")
                     .size_full()
                     .overflow_scroll()
+                    .track_scroll(&self.scroll_handle)
                     .p_4()
                     .gap_4()
                     .flex()
                     .flex_col()
                     .items_center()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            if event.click_count == 2 {
+                                this.inverse_search(event.position, window, cx);
+                            }
+                        }),
+                    )
                     .children(pages.iter().map(|page| {
-                        let size = page.size(0);
-                        let aspect_ratio = size.height.0 as f32 / size.width.0 as f32;
-                        img(ImageSource::Render(page.clone()))
+                        let height = display_width * page.height_points / page.width_points;
+                        img(ImageSource::Render(page.image.clone()))
                             .w(px(display_width))
-                            .h(px(display_width * aspect_ratio))
+                            .h(px(height))
                             .flex_shrink_0()
                             .into_any_element()
                     }))
@@ -335,6 +483,63 @@ impl WorkspaceProjectItem for PdfView {
     ) -> Self {
         Self::new(item, cx)
     }
+}
+
+/// Moves the PDF next to the active source file to the cursor position. The PDF is
+/// opened first when it is not already open in the workspace.
+fn forward_search(
+    workspace: &mut Workspace,
+    _: &ForwardSearch,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(active_item) = workspace.active_item(cx) else {
+        return;
+    };
+    let Some(editor) = active_item.act_as::<Editor>(cx) else {
+        return;
+    };
+    let Some(project_path) = active_item.project_path(cx) else {
+        return;
+    };
+    let Some(source_path) = workspace.project().read(cx).absolute_path(&project_path, cx) else {
+        return;
+    };
+    let cursor = editor.update(cx, |editor, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        editor.selections.newest::<TextPoint>(&snapshot).head()
+    });
+    let pdf_path = source_path.with_extension("pdf");
+    let existing_view = workspace
+        .items_of_type::<PdfView>(cx)
+        .find(|view| view.read(cx).pdf_item.read(cx).abs_path.as_deref() == Some(&pdf_path));
+
+    cx.spawn_in(window, async move |workspace, cx| -> Result<()> {
+        let line = cursor.row + 1;
+        let column = cursor.column;
+        let position = cx
+            .background_spawn({
+                let source_path = source_path.clone();
+                let pdf_path = pdf_path.clone();
+                async move { synctex::forward_search(&source_path, line, column, &pdf_path) }
+            })
+            .await?;
+
+        let view = match existing_view {
+            Some(view) => view,
+            None => {
+                let open_task = workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.open_abs_path(pdf_path, OpenOptions::default(), window, cx)
+                })?;
+                let item = open_task.await?;
+                cx.update(|_, cx| item.act_as::<PdfView>(cx))?
+                    .context("the opened file is not a PDF view")?
+            }
+        };
+        view.update(cx, |view, cx| view.reveal(position, cx));
+        Ok(())
+    })
+    .detach_and_log_err(cx);
 }
 
 #[cfg(test)]
