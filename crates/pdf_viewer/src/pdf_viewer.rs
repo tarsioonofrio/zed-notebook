@@ -1,8 +1,6 @@
 mod synctex;
 
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context as _, Result};
@@ -142,12 +140,6 @@ fn render_all_pages(bytes: &[u8], target_width: i32) -> Result<Vec<RenderedPage>
         .collect()
 }
 
-fn is_pdf_path(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
-}
-
 pub struct PdfItem {
     project_path: ProjectPath,
     abs_path: Option<PathBuf>,
@@ -161,10 +153,17 @@ impl project::ProjectItem for PdfItem {
         path: &ProjectPath,
         cx: &mut App,
     ) -> Option<Task<Result<Entity<Self>>>> {
-        if !is_pdf_path(path.path.as_unix_str()) {
+        let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
+        // A file opened on its own gets a worktree rooted at the file, so its relative
+        // path is empty and the extension has to come from the worktree.
+        let worktree_abs_path = worktree.read(cx).abs_path();
+        let extension = path
+            .path
+            .extension()
+            .or_else(|| worktree_abs_path.extension()?.to_str());
+        if !extension.is_some_and(|extension| extension.eq_ignore_ascii_case("pdf")) {
             return None;
         }
-        let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
         let project_path = path.clone();
         let abs_path = project.read(cx).absolute_path(path, cx);
         Some(cx.spawn(async move |cx| -> Result<Entity<Self>> {
@@ -207,7 +206,6 @@ pub struct PdfView {
     pages: PagesState,
     zoom: f32,
     scroll_handle: ScrollHandle,
-    page_bounds: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     pending_reveal: Option<PdfPosition>,
     _render_task: Task<()>,
 }
@@ -220,7 +218,6 @@ impl PdfView {
             pages: PagesState::Loading,
             zoom: 1.0,
             scroll_handle: ScrollHandle::new(),
-            page_bounds: Rc::new(RefCell::new(Vec::new())),
             pending_reveal: None,
             _render_task: Task::ready(()),
         };
@@ -293,29 +290,33 @@ impl PdfView {
     }
 
     fn inverse_search(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let page_bounds = self.page_bounds.borrow();
-        let Some((index, bounds)) = page_bounds
-            .iter()
-            .enumerate()
-            .find(|(_, bounds)| bounds.contains(&position))
-        else {
+        let PagesState::Rendered(pages) = &self.pages else {
+            log::warn!("pdf inverse search: the PDF is not rendered yet");
             return;
         };
-        let PagesState::Rendered(pages) = &self.pages else {
+        let Some((index, bounds)) = (0..pages.len()).find_map(|index| {
+            let bounds = self.scroll_handle.bounds_for_item(index)?;
+            bounds.contains(&position).then_some((index, bounds))
+        }) else {
+            log::warn!("pdf inverse search: click {position:?} is outside every page");
             return;
         };
         let Some(page) = pages.get(index) else {
+            log::warn!("pdf inverse search: no rendered page at index {index}");
             return;
         };
         let scale = f32::from(bounds.size.width) / page.width_points;
         let x = f32::from(position.x - bounds.origin.x) / scale;
         let y = f32::from(position.y - bounds.origin.y) / scale;
         let Some(pdf_path) = self.pdf_item.read(cx).abs_path.clone() else {
+            log::warn!("pdf inverse search: the PDF has no absolute path");
             return;
         };
         let Some(workspace) = Workspace::for_window(window, cx) else {
+            log::warn!("pdf inverse search: no workspace for this window");
             return;
         };
+        log::info!("pdf inverse search: page {} at ({x:.1}, {y:.1}) pt", index + 1);
         let pdf_position = PdfPosition {
             page: index as u32 + 1,
             x,
@@ -395,11 +396,7 @@ impl Render for PdfView {
                 .into_any_element(),
             PagesState::Rendered(pages) => {
                 let display_width = self.display_width();
-                let page_bounds = self.page_bounds.clone();
                 div()
-                    .on_children_prepainted(move |bounds, _, _| {
-                        *page_bounds.borrow_mut() = bounds;
-                    })
                     .id("pdf-pages")
                     .size_full()
                     .overflow_scroll()

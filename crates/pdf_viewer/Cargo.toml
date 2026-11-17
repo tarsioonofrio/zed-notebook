@@ -18,6 +18,7 @@ editor.workspace = true
 language.workspace = true
 gpui.workspace = true
 image.workspace = true
+log.workspace = true
 project.workspace = true
 pdfium-render.workspace = true
 smallvec.workspace = true
