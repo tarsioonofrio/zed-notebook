@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context as _, Result};
 use gpui::{
@@ -11,14 +11,17 @@ use image::{Frame, RgbaImage};
 use pdfium_render::prelude::*;
 use project::{Project, ProjectEntryId, ProjectPath};
 use smallvec::smallvec;
-use ui::{Label, prelude::*};
+use ui::{Button, ButtonStyle, IconButton, IconSize, Label, prelude::*};
 use workspace::{
     Pane,
     item::{Item, ItemEvent, ProjectItem as WorkspaceProjectItem, TabContentParams},
 };
 
 const PDFIUM_LIBRARY_DIRECTORY_ENV: &str = "PDFIUM_LIBRARY_DIRECTORY";
-const PAGE_RENDER_WIDTH: i32 = 1200;
+const BASE_PAGE_WIDTH: f32 = 900.0;
+const ZOOM_FACTOR: f32 = 1.25;
+const MIN_ZOOM: f32 = 0.5;
+const MAX_ZOOM: f32 = 4.0;
 
 pub fn init(cx: &mut App) {
     workspace::register_project_item::<PdfView>(cx);
@@ -46,6 +49,16 @@ fn bind_default_pdfium() -> Result<Pdfium> {
             Ok(Pdfium::new(bindings))
         }
     }
+}
+
+/// pdfium can only be bound once per process, so every document shares this instance.
+static PDFIUM: OnceLock<std::result::Result<Pdfium, String>> = OnceLock::new();
+
+fn shared_pdfium() -> Result<&'static Pdfium> {
+    PDFIUM
+        .get_or_init(|| bind_default_pdfium().map_err(|error| format!("{error:#}")))
+        .as_ref()
+        .map_err(|message| anyhow::anyhow!("{message}"))
 }
 
 /// Renders one page of an open document to an image `target_width` pixels wide,
@@ -79,14 +92,14 @@ pub fn render_page(
     Ok(Arc::new(RenderImage::new(smallvec![Frame::new(buffer)])))
 }
 
-fn render_all_pages(bytes: &[u8]) -> Result<Vec<Arc<RenderImage>>> {
-    let pdfium = bind_default_pdfium()?;
+fn render_all_pages(bytes: &[u8], target_width: i32) -> Result<Vec<Arc<RenderImage>>> {
+    let pdfium = shared_pdfium()?;
     let document = pdfium
         .load_pdf_from_byte_slice(bytes, None)
         .context("failed to open the PDF document")?;
     let page_count = document.pages().len();
     (0..page_count)
-        .map(|page_index| render_page(&document, page_index.into(), PAGE_RENDER_WIDTH))
+        .map(|page_index| render_page(&document, page_index.into(), target_width))
         .collect()
 }
 
@@ -150,15 +163,29 @@ pub struct PdfView {
     pdf_item: Entity<PdfItem>,
     focus_handle: FocusHandle,
     pages: PagesState,
+    zoom: f32,
     _render_task: Task<()>,
 }
 
 impl PdfView {
     fn new(pdf_item: Entity<PdfItem>, cx: &mut Context<Self>) -> Self {
-        let bytes = pdf_item.read(cx).bytes.clone();
-        let render_task = cx.spawn(async move |this: WeakEntity<Self>, cx| {
+        let mut view = Self {
+            pdf_item,
+            focus_handle: cx.focus_handle(),
+            pages: PagesState::Loading,
+            zoom: 1.0,
+            _render_task: Task::ready(()),
+        };
+        view.render_pages(cx);
+        view
+    }
+
+    fn render_pages(&mut self, cx: &mut Context<Self>) {
+        let bytes = self.pdf_item.read(cx).bytes.clone();
+        let target_width = (BASE_PAGE_WIDTH * self.zoom).round() as i32;
+        self._render_task = cx.spawn(async move |this: WeakEntity<Self>, cx| {
             let rendered = cx
-                .background_spawn(async move { render_all_pages(&bytes) })
+                .background_spawn(async move { render_all_pages(&bytes, target_width) })
                 .await;
             this.update(cx, |this, cx| {
                 this.pages = match rendered {
@@ -169,12 +196,47 @@ impl PdfView {
             })
             .ok();
         });
-        Self {
-            pdf_item,
-            focus_handle: cx.focus_handle(),
-            pages: PagesState::Loading,
-            _render_task: render_task,
+    }
+
+    fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        if (zoom - self.zoom).abs() < f32::EPSILON {
+            return;
         }
+        self.zoom = zoom;
+        self.render_pages(cx);
+        cx.notify();
+    }
+
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .p_1()
+            .gap_1()
+            .justify_center()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                IconButton::new("pdf-zoom-out", IconName::Dash)
+                    .icon_size(IconSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_zoom(this.zoom / ZOOM_FACTOR, cx);
+                    })),
+            )
+            .child(
+                Button::new("pdf-zoom-reset", format!("{:.0}%", self.zoom * 100.))
+                    .style(ButtonStyle::Subtle)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_zoom(1.0, cx);
+                    })),
+            )
+            .child(
+                IconButton::new("pdf-zoom-in", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_zoom(this.zoom * ZOOM_FACTOR, cx);
+                    })),
+            )
     }
 }
 
@@ -195,28 +257,37 @@ impl Render for PdfView {
             PagesState::Failed(message) => Label::new(message.clone())
                 .color(Color::Error)
                 .into_any_element(),
-            PagesState::Rendered(pages) => div()
-                .id("pdf-pages")
-                .size_full()
-                .overflow_y_scroll()
-                .p_4()
-                .gap_4()
-                .flex()
-                .flex_col()
-                .items_center()
-                .children(pages.iter().map(|page| {
-                    img(ImageSource::Render(page.clone()))
-                        .w_full()
-                        .max_w(px(900.))
-                        .into_any_element()
-                }))
-                .into_any_element(),
+            PagesState::Rendered(pages) => {
+                let display_width = BASE_PAGE_WIDTH * self.zoom;
+                div()
+                    .id("pdf-pages")
+                    .size_full()
+                    .overflow_scroll()
+                    .p_4()
+                    .gap_4()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .children(pages.iter().map(|page| {
+                        let size = page.size(0);
+                        let aspect_ratio = size.height.0 as f32 / size.width.0 as f32;
+                        img(ImageSource::Render(page.clone()))
+                            .w(px(display_width))
+                            .h(px(display_width * aspect_ratio))
+                            .flex_shrink_0()
+                            .into_any_element()
+                    }))
+                    .into_any_element()
+            }
         };
         div()
             .track_focus(&self.focus_handle)
             .size_full()
+            .flex()
+            .flex_col()
             .bg(cx.theme().colors().editor_background)
-            .child(content)
+            .child(self.render_toolbar(cx))
+            .child(div().flex_1().min_h_0().w_full().child(content))
     }
 }
 

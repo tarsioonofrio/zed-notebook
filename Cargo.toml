@@ -449,7 +449,7 @@ outline_panel = { path = "crates/outline_panel" }
 path = { path = "crates/path" }
 paths = { path = "crates/paths" }
 pdf_viewer = { path = "crates/pdf_viewer" }
-pdfium-render = "0.9.5"
+pdfium-render = { version = "0.9.5", features = ["thread_safe"] }
 perf = { path = "tooling/perf", default-features = false }
 picker = { path = "crates/picker" }
 picker_preview = { path = "crates/picker_preview" }
