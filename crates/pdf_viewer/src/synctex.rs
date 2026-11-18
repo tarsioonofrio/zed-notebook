@@ -10,6 +10,8 @@ pub struct PdfPosition {
     pub page: u32,
     pub x: f32,
     pub y: f32,
+    /// Width of the source line's box, or zero when the position came from a click.
+    pub width: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -25,10 +27,12 @@ pub fn forward_search(source: &Path, line: u32, column: u32, pdf: &Path) -> Resu
     let page = field(&output, "Page").context("synctex did not report a page")?;
     let x = field(&output, "x").context("synctex did not report an x position")?;
     let y = field(&output, "y").context("synctex did not report a y position")?;
+    let width = field(&output, "W").context("synctex did not report a width")?;
     Ok(PdfPosition {
         page: page.parse().context("invalid synctex page")?,
         x: x.parse().context("invalid synctex x position")?,
         y: y.parse().context("invalid synctex y position")?,
+        width: width.parse().context("invalid synctex width")?,
     })
 }
 

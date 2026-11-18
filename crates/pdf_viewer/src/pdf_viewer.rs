@@ -2,13 +2,15 @@ mod synctex;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use editor::Editor;
 use gpui::{
-    AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, RenderImage,
-    ScrollHandle, SharedString, Styled, Task, WeakEntity, Window, actions, div, img, point, px,
+    AnyElement, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    ImageSource, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, RenderImage, ScrollHandle, SharedString, Styled, Task,
+    WeakEntity, Window, actions, div, img, point, px, red,
 };
 use image::{Frame, RgbaImage};
 use language::Point as TextPoint;
@@ -112,11 +114,21 @@ pub fn render_page(
     Ok(Arc::new(RenderImage::new(smallvec![Frame::new(buffer)])))
 }
 
+struct CharacterBox {
+    character: char,
+    /// Bounds in PDF points with the origin at the top left of the page.
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
 struct RenderedPage {
     image: Arc<RenderImage>,
     /// The page size in PDF points, used to map between PDF and screen coordinates.
     width_points: f32,
     height_points: f32,
+    characters: Vec<CharacterBox>,
 }
 
 fn render_all_pages(bytes: &[u8], target_width: i32) -> Result<Vec<RenderedPage>> {
@@ -131,10 +143,31 @@ fn render_all_pages(bytes: &[u8], target_width: i32) -> Result<Vec<RenderedPage>
                 .pages()
                 .get(page_index.into())
                 .context("the PDF has no page at this index")?;
+            let height_points = page.height().value;
+            let characters = page
+                .text()
+                .map(|text| {
+                    text.chars()
+                        .iter()
+                        .filter_map(|character| {
+                            let character_value = character.unicode_char()?;
+                            let bounds = character.loose_bounds().ok()?;
+                            Some(CharacterBox {
+                                character: character_value,
+                                left: bounds.left().value,
+                                top: height_points - bounds.top().value,
+                                right: bounds.right().value,
+                                bottom: height_points - bounds.bottom().value,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             Ok(RenderedPage {
                 image: render_page(&document, page_index.into(), target_width)?,
                 width_points: page.width().value,
-                height_points: page.height().value,
+                height_points,
+                characters,
             })
         })
         .collect()
@@ -207,8 +240,14 @@ pub struct PdfView {
     zoom: f32,
     scroll_handle: ScrollHandle,
     pending_reveal: Option<PdfPosition>,
+    highlight: Option<PdfPosition>,
+    selection: Option<(Anchor, Anchor)>,
+    drag_anchor: Option<Anchor>,
     _render_task: Task<()>,
+    _highlight_task: Task<()>,
 }
+
+type Anchor = (usize, usize);
 
 impl PdfView {
     fn new(pdf_item: Entity<PdfItem>, cx: &mut Context<Self>) -> Self {
@@ -219,7 +258,11 @@ impl PdfView {
             zoom: 1.0,
             scroll_handle: ScrollHandle::new(),
             pending_reveal: None,
+            highlight: None,
+            selection: None,
+            drag_anchor: None,
             _render_task: Task::ready(()),
+            _highlight_task: Task::ready(()),
         };
         view.render_pages(cx);
         view
@@ -281,12 +324,153 @@ impl PdfView {
                 self.scroll_handle
                     .set_offset(point(px(0.), px(-(y - REVEAL_TOP_MARGIN).max(0.))));
                 self.pending_reveal = None;
+                self.highlight = Some(position);
+                self._highlight_task = cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                    cx.background_executor().timer(Duration::from_secs(2)).await;
+                    this.update(cx, |this, cx| {
+                        this.highlight = None;
+                        cx.notify();
+                    })
+                    .ok();
+                });
                 cx.notify();
                 return;
             }
             page_top += page_height + PAGE_SPACING;
         }
         self.pending_reveal = None;
+    }
+
+    fn current_page(&self) -> usize {
+        let PagesState::Rendered(pages) = &self.pages else {
+            return 0;
+        };
+        if pages.is_empty() {
+            return 0;
+        }
+        let viewport_height = f32::from(self.scroll_handle.bounds().size.height);
+        let visible_top = -f32::from(self.scroll_handle.offset().y) + viewport_height / 3.0;
+        let display_width = self.display_width();
+        let mut page_top = PAGE_SPACING;
+        let mut current_page = 1;
+        for (index, page) in pages.iter().enumerate() {
+            if page_top > visible_top {
+                break;
+            }
+            current_page = index + 1;
+            page_top += display_width * page.height_points / page.width_points + PAGE_SPACING;
+        }
+        current_page
+    }
+
+    fn fit_width(&mut self, cx: &mut Context<Self>) {
+        let viewport_width = f32::from(self.scroll_handle.bounds().size.width);
+        if viewport_width <= 0.0 {
+            return;
+        }
+        // The scroll area has p_4 padding on both sides.
+        self.set_zoom((viewport_width - 32.0) / BASE_PAGE_WIDTH, cx);
+    }
+
+    fn fit_page(&mut self, cx: &mut Context<Self>) {
+        let viewport_height = f32::from(self.scroll_handle.bounds().size.height);
+        if viewport_height <= 0.0 {
+            return;
+        }
+        let PagesState::Rendered(pages) = &self.pages else {
+            return;
+        };
+        let Some(page) = pages.first() else {
+            return;
+        };
+        let page_height = BASE_PAGE_WIDTH * page.height_points / page.width_points;
+        self.set_zoom((viewport_height - 32.0) / page_height, cx);
+    }
+
+    fn hit_test(&self, position: Point<Pixels>) -> Option<Anchor> {
+        let PagesState::Rendered(pages) = &self.pages else {
+            return None;
+        };
+        let (page_index, bounds) = (0..pages.len()).find_map(|index| {
+            let bounds = self.scroll_handle.bounds_for_item(index)?;
+            bounds.contains(&position).then_some((index, bounds))
+        })?;
+        let page = pages.get(page_index)?;
+        let scale = f32::from(bounds.size.width) / page.width_points;
+        if scale <= 0.0 {
+            return None;
+        }
+        let x = f32::from(position.x - bounds.origin.x) / scale;
+        let y = f32::from(position.y - bounds.origin.y) / scale;
+        let character_index = page
+            .characters
+            .iter()
+            .position(|character| {
+                x >= character.left
+                    && x <= character.right
+                    && y >= character.top
+                    && y <= character.bottom
+            })
+            .or_else(|| {
+                page.characters
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, left), (_, right)| {
+                        let left_center_x = (left.left + left.right) / 2.0;
+                        let left_center_y = (left.top + left.bottom) / 2.0;
+                        let right_center_x = (right.left + right.right) / 2.0;
+                        let right_center_y = (right.top + right.bottom) / 2.0;
+                        let left_distance =
+                            (left_center_x - x).powi(2) + (left_center_y - y).powi(2);
+                        let right_distance =
+                            (right_center_x - x).powi(2) + (right_center_y - y).powi(2);
+                        left_distance.total_cmp(&right_distance)
+                    })
+                    .map(|(index, _)| index)
+            })?;
+        Some((page_index, character_index))
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((first, second)) = self.selection else {
+            return;
+        };
+        let PagesState::Rendered(pages) = &self.pages else {
+            return;
+        };
+        let (start, end) = if first <= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let mut text = String::new();
+        let mut has_text = false;
+        for page_index in start.0..=end.0 {
+            let Some(page) = pages.get(page_index) else {
+                continue;
+            };
+            let start_character = if page_index == start.0 {
+                start.1.min(page.characters.len())
+            } else {
+                0
+            };
+            let end_character = if page_index == end.0 {
+                end.1.saturating_add(1).min(page.characters.len())
+            } else {
+                page.characters.len()
+            };
+            if start_character >= end_character {
+                continue;
+            }
+            if has_text {
+                text.push('\n');
+            }
+            for character in &page.characters[start_character..end_character] {
+                text.push(character.character);
+            }
+            has_text = true;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     fn inverse_search(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
@@ -321,6 +505,7 @@ impl PdfView {
             page: index as u32 + 1,
             x,
             y,
+            width: 0.0,
         };
         cx.spawn_in(window, async move |_, cx| -> Result<()> {
             let source = cx
@@ -346,6 +531,11 @@ impl PdfView {
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let page_count = match &self.pages {
+            PagesState::Rendered(pages) => pages.len(),
+            PagesState::Loading | PagesState::Failed(_) => 0,
+        };
+        let current_page = self.current_page();
         h_flex()
             .w_full()
             .p_1()
@@ -374,6 +564,21 @@ impl PdfView {
                         this.set_zoom(this.zoom * ZOOM_FACTOR, cx);
                     })),
             )
+            .child(
+                Button::new("pdf-fit-width", "Fit width")
+                    .style(ButtonStyle::Subtle)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.fit_width(cx);
+                    })),
+            )
+            .child(
+                Button::new("pdf-fit-page", "Fit page")
+                    .style(ButtonStyle::Subtle)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.fit_page(cx);
+                    })),
+            )
+            .child(Label::new(format!("{current_page} / {page_count}")))
     }
 }
 
@@ -387,6 +592,9 @@ impl Focusable for PdfView {
 
 impl Render for PdfView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let selection = self.selection;
+        let highlight = self.highlight;
+        let selection_color = cx.theme().colors().text_accent.opacity(0.3);
         let content: AnyElement = match &self.pages {
             PagesState::Loading => Label::new("Rendering PDF…")
                 .color(Color::Muted)
@@ -411,15 +619,92 @@ impl Render for PdfView {
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             if event.click_count == 2 {
                                 this.inverse_search(event.position, window, cx);
+                            } else if event.click_count == 1 {
+                                window.focus(&this.focus_handle, cx);
+                                this.selection = None;
+                                this.drag_anchor = this.hit_test(event.position);
+                                cx.notify();
                             }
                         }),
                     )
-                    .children(pages.iter().map(|page| {
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if event.pressed_button != Some(MouseButton::Left) {
+                            return;
+                        }
+                        let Some(anchor) = this.drag_anchor else {
+                            return;
+                        };
+                        this.selection =
+                            this.hit_test(event.position).map(|current| (anchor, current));
+                        cx.notify();
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, _cx| {
+                            this.drag_anchor = None;
+                        }),
+                    )
+                    .children(pages.iter().enumerate().map(|(page_index, page)| {
                         let height = display_width * page.height_points / page.width_points;
-                        img(ImageSource::Render(page.image.clone()))
+                        let scale = display_width / page.width_points;
+                        let mut overlays: Vec<AnyElement> = Vec::new();
+                        if let Some(position) = highlight
+                            .filter(|position| position.page as usize == page_index + 1)
+                        {
+                            let left = position.x * scale;
+                            let top = position.y * scale;
+                            let width = position.width * scale;
+                            overlays.push(
+                                div()
+                                    .absolute()
+                                    .left(px(left))
+                                    .top(px(top))
+                                    .w(px(width))
+                                    .h(px(2.0))
+                                    .bg(red())
+                                    .into_any_element(),
+                            );
+                        }
+                        if let Some((first, second)) = selection {
+                            let (start, end) = if first <= second {
+                                (first, second)
+                            } else {
+                                (second, first)
+                            };
+                            if page_index >= start.0 && page_index <= end.0 {
+                                for (character_index, character) in
+                                    page.characters.iter().enumerate()
+                                {
+                                    let anchor = (page_index, character_index);
+                                    if anchor < start || anchor > end {
+                                        continue;
+                                    }
+                                    let left = character.left * scale;
+                                    let top = character.top * scale;
+                                    let width =
+                                        (character.right - character.left).max(0.0) * scale;
+                                    let height =
+                                        (character.bottom - character.top).max(0.0) * scale;
+                                    overlays.push(
+                                        div()
+                                            .absolute()
+                                            .left(px(left))
+                                            .top(px(top))
+                                            .w(px(width))
+                                            .h(px(height))
+                                            .bg(selection_color)
+                                            .into_any_element(),
+                                    );
+                                }
+                            }
+                        }
+                        div()
+                            .relative()
                             .w(px(display_width))
                             .h(px(height))
                             .flex_shrink_0()
+                            .child(img(ImageSource::Render(page.image.clone())).size_full())
+                            .children(overlays)
                             .into_any_element()
                     }))
                     .into_any_element()
@@ -431,6 +716,9 @@ impl Render for PdfView {
             .flex()
             .flex_col()
             .bg(cx.theme().colors().editor_background)
+            .on_action(cx.listener(|this, _: &editor::actions::Copy, _, cx| {
+                this.copy_selection(cx);
+            }))
             .child(self.render_toolbar(cx))
             .child(div().flex_1().min_h_0().w_full().child(content))
     }
@@ -482,8 +770,7 @@ impl WorkspaceProjectItem for PdfView {
     }
 }
 
-/// Moves the PDF next to the active source file to the cursor position. The PDF is
-/// opened first when it is not already open in the workspace.
+/// Moves the PDF next to the active source file to the cursor position.
 fn forward_search(
     workspace: &mut Workspace,
     _: &ForwardSearch,
@@ -507,9 +794,6 @@ fn forward_search(
         editor.selections.newest::<TextPoint>(&snapshot).head()
     });
     let pdf_path = source_path.with_extension("pdf");
-    let existing_view = workspace
-        .items_of_type::<PdfView>(cx)
-        .find(|view| view.read(cx).pdf_item.read(cx).abs_path.as_deref() == Some(&pdf_path));
 
     cx.spawn_in(window, async move |workspace, cx| -> Result<()> {
         let line = cursor.row + 1;
@@ -522,17 +806,13 @@ fn forward_search(
             })
             .await?;
 
-        let view = match existing_view {
-            Some(view) => view,
-            None => {
-                let open_task = workspace.update_in(cx, |workspace, window, cx| {
-                    workspace.open_abs_path(pdf_path, OpenOptions::default(), window, cx)
-                })?;
-                let item = open_task.await?;
-                cx.update(|_, cx| item.act_as::<PdfView>(cx))?
-                    .context("the opened file is not a PDF view")?
-            }
-        };
+        let open_task = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_abs_path(pdf_path, OpenOptions::default(), window, cx)
+        })?;
+        let item = open_task.await?;
+        let view = cx
+            .update(|_, cx| item.act_as::<PdfView>(cx))?
+            .context("the opened file is not a PDF view")?;
         view.update(cx, |view, cx| view.reveal(position, cx));
         Ok(())
     })
