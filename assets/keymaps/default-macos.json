@@ -1816,4 +1816,11 @@
       "right": ["tabular_data::MoveFocusedCell", { "direction": "right" }],
     },
   },
+  {
+    "context": "PdfViewer",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-c": "editor::Copy",
+    },
+  },
 ]

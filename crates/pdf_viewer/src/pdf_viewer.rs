@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use editor::Editor;
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    AnyElement, App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
     ImageSource, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Point, Render, RenderImage, ScrollHandle, SharedString, Styled, Task,
     WeakEntity, Window, actions, div, img, point, px, red,
@@ -17,7 +17,10 @@ use language::Point as TextPoint;
 use pdfium_render::prelude::*;
 use project::{Project, ProjectEntryId, ProjectPath};
 use smallvec::smallvec;
-use ui::{Button, ButtonStyle, IconButton, IconSize, Label, prelude::*};
+use ui::{
+    Button, ButtonStyle, IconButton, IconSize, Label, ToggleButtonGroup, ToggleButtonSimple,
+    prelude::*,
+};
 use workspace::{
     OpenOptions, Pane, Workspace,
     item::{Item, ItemEvent, ProjectItem as WorkspaceProjectItem, TabContentParams},
@@ -40,6 +43,13 @@ const REVEAL_TOP_MARGIN: f32 = 120.0;
 const ZOOM_FACTOR: f32 = 1.25;
 const MIN_ZOOM: f32 = 0.5;
 const MAX_ZOOM: f32 = 4.0;
+const SIDEBAR_WIDTH: f32 = 220.0;
+const SCROLLBAR_WIDTH: f32 = 8.0;
+const SCROLLBAR_TRACK_WIDTH: f32 = 16.0;
+const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 32.0;
+const THUMBNAIL_WIDTH: f32 = 140.0;
+const THUMBNAIL_RENDER_WIDTH: i32 = 280;
+const PDF_VIEWER_KEY_CONTEXT: &str = "PdfViewer";
 
 pub fn init(cx: &mut App) {
     workspace::register_project_item::<PdfView>(cx);
@@ -125,19 +135,49 @@ struct CharacterBox {
 
 struct RenderedPage {
     image: Arc<RenderImage>,
+    thumbnail: Arc<RenderImage>,
     /// The page size in PDF points, used to map between PDF and screen coordinates.
     width_points: f32,
     height_points: f32,
     characters: Vec<CharacterBox>,
 }
 
-fn render_all_pages(bytes: &[u8], target_width: i32) -> Result<Vec<RenderedPage>> {
+struct OutlineEntry {
+    title: SharedString,
+    depth: usize,
+    page_index: Option<usize>,
+}
+
+fn read_outline(document: &PdfDocument) -> Vec<OutlineEntry> {
+    document
+        .bookmarks()
+        .iter()
+        .map(|bookmark| OutlineEntry {
+            title: bookmark
+                .title()
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| "Untitled".to_string())
+                .into(),
+            depth: std::iter::successors(bookmark.parent(), |parent| parent.parent()).count(),
+            page_index: bookmark
+                .destination()
+                .and_then(|destination| destination.page_index().ok())
+                .and_then(|index| usize::try_from(index).ok()),
+        })
+        .collect()
+}
+
+fn render_all_pages(
+    bytes: &[u8],
+    target_width: i32,
+) -> Result<(Vec<RenderedPage>, Vec<OutlineEntry>)> {
     let pdfium = shared_pdfium()?;
     let document = pdfium
         .load_pdf_from_byte_slice(bytes, None)
         .context("failed to open the PDF document")?;
+    let outline = read_outline(&document);
     let page_count = document.pages().len();
-    (0..page_count)
+    let pages = (0..page_count)
         .map(|page_index| {
             let page = document
                 .pages()
@@ -165,12 +205,14 @@ fn render_all_pages(bytes: &[u8], target_width: i32) -> Result<Vec<RenderedPage>
                 .unwrap_or_default();
             Ok(RenderedPage {
                 image: render_page(&document, page_index.into(), target_width)?,
+                thumbnail: render_page(&document, page_index.into(), THUMBNAIL_RENDER_WIDTH)?,
                 width_points: page.width().value,
                 height_points,
                 characters,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((pages, outline))
 }
 
 pub struct PdfItem {
@@ -233,16 +275,34 @@ enum PagesState {
     Failed(SharedString),
 }
 
+fn scrollbar_thumb_height(viewport_height: f32, max_offset_y: f32) -> f32 {
+    let content_height = viewport_height + max_offset_y;
+    (viewport_height * viewport_height / content_height).clamp(
+        SCROLLBAR_MIN_THUMB_HEIGHT.min(viewport_height),
+        viewport_height,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarMode {
+    Hidden,
+    Outline,
+    Thumbnails,
+}
+
 pub struct PdfView {
     pdf_item: Entity<PdfItem>,
     focus_handle: FocusHandle,
     pages: PagesState,
+    outline: Vec<OutlineEntry>,
+    sidebar_mode: SidebarMode,
     zoom: f32,
     scroll_handle: ScrollHandle,
     pending_reveal: Option<PdfPosition>,
     highlight: Option<PdfPosition>,
     selection: Option<(Anchor, Anchor)>,
     drag_anchor: Option<Anchor>,
+    scrollbar_dragging: bool,
     _render_task: Task<()>,
     _highlight_task: Task<()>,
 }
@@ -255,12 +315,15 @@ impl PdfView {
             pdf_item,
             focus_handle: cx.focus_handle(),
             pages: PagesState::Loading,
+            outline: Vec::new(),
+            sidebar_mode: SidebarMode::Hidden,
             zoom: 1.0,
             scroll_handle: ScrollHandle::new(),
             pending_reveal: None,
             highlight: None,
             selection: None,
             drag_anchor: None,
+            scrollbar_dragging: false,
             _render_task: Task::ready(()),
             _highlight_task: Task::ready(()),
         };
@@ -277,7 +340,10 @@ impl PdfView {
                 .await;
             this.update(cx, |this, cx| {
                 this.pages = match rendered {
-                    Ok(pages) => PagesState::Rendered(pages),
+                    Ok((pages, outline)) => {
+                        this.outline = outline;
+                        PagesState::Rendered(pages)
+                    }
                     Err(error) => PagesState::Failed(format!("{error:#}").into()),
                 };
                 this.apply_pending_reveal(cx);
@@ -387,14 +453,136 @@ impl PdfView {
         self.set_zoom((viewport_height - 32.0) / page_height, cx);
     }
 
+    /// Scrolls so the thumb's centre follows `pointer_y`, the pointer's window y coordinate.
+    fn scroll_to_pointer(&mut self, pointer_y: Pixels, cx: &mut Context<Self>) {
+        let viewport = self.scroll_handle.bounds();
+        let viewport_height = f32::from(viewport.size.height);
+        let max_offset_y = f32::from(self.scroll_handle.max_offset().y);
+        if viewport_height <= 0.0 || max_offset_y <= 0.0 {
+            return;
+        }
+        let thumb_height = scrollbar_thumb_height(viewport_height, max_offset_y);
+        let thumb_travel = (viewport_height - thumb_height).max(f32::EPSILON);
+        let thumb_top = f32::from(pointer_y - viewport.origin.y) - thumb_height / 2.0;
+        let ratio = (thumb_top / thumb_travel).clamp(0.0, 1.0);
+        self.scroll_handle
+            .set_offset(point(px(0.), px(-ratio * max_offset_y)));
+        cx.notify();
+    }
+
+    fn scroll_to_page(&mut self, page_index: usize, cx: &mut Context<Self>) {
+        let PagesState::Rendered(pages) = &self.pages else {
+            return;
+        };
+        let display_width = self.display_width();
+        let mut page_top = PAGE_SPACING;
+        for page in pages.iter().take(page_index) {
+            page_top += display_width * page.height_points / page.width_points + PAGE_SPACING;
+        }
+        self.scroll_handle
+            .set_offset(point(px(0.), px(-page_top.max(0.))));
+        cx.notify();
+    }
+
+    fn toggle_sidebar(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
+        self.sidebar_mode = if self.sidebar_mode == mode {
+            SidebarMode::Hidden
+        } else {
+            mode
+        };
+        cx.notify();
+    }
+
+    fn render_sidebar(&self, pages: &[RenderedPage], cx: &mut Context<Self>) -> AnyElement {
+        match self.sidebar_mode {
+            SidebarMode::Hidden => div().into_any_element(),
+            SidebarMode::Outline if self.outline.is_empty() => {
+                Label::new("This PDF has no outline")
+                    .color(Color::Muted)
+                    .into_any_element()
+            }
+            SidebarMode::Outline => v_flex()
+                .id("pdf-outline")
+                .size_full()
+                .overflow_y_scroll()
+                .p_1()
+                .children(self.outline.iter().enumerate().map(|(index, entry)| {
+                    let page_index = entry.page_index;
+                    div()
+                        .id(("pdf-outline-entry", index))
+                        .w_full()
+                        .py_0p5()
+                        .pl(px(8.0 + 12.0 * entry.depth as f32))
+                        .pr_2()
+                        .rounded_sm()
+                        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                        .when_some(page_index, |this, page_index| {
+                            this.cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.scroll_to_page(page_index, cx);
+                                }))
+                        })
+                        .child(Label::new(entry.title.clone()).single_line())
+                }))
+                .into_any_element(),
+            SidebarMode::Thumbnails => {
+                let current_page = self.current_page();
+                v_flex()
+                    .id("pdf-thumbnails")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .p_2()
+                    .gap_2()
+                    .items_center()
+                    .children(pages.iter().enumerate().map(|(index, page)| {
+                        let height = THUMBNAIL_WIDTH * page.height_points / page.width_points;
+                        let border_color = if index + 1 == current_page {
+                            cx.theme().colors().border_focused
+                        } else {
+                            cx.theme().colors().border
+                        };
+                        v_flex()
+                            .id(("pdf-thumbnail", index))
+                            .gap_1()
+                            .items_center()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.scroll_to_page(index, cx);
+                            }))
+                            .child(
+                                div().border_1().border_color(border_color).child(
+                                    img(ImageSource::Render(page.thumbnail.clone()))
+                                        .w(px(THUMBNAIL_WIDTH))
+                                        .h(px(height)),
+                                ),
+                            )
+                            .child(Label::new((index + 1).to_string()).color(Color::Muted))
+                    }))
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// Returns the page under `position` and its on-screen bounds. The scroll handle
+    /// reports child bounds before scrolling, so the scroll offset is added here.
+    fn page_at(
+        &self,
+        page_count: usize,
+        position: Point<Pixels>,
+    ) -> Option<(usize, Bounds<Pixels>)> {
+        let offset = self.scroll_handle.offset();
+        (0..page_count).find_map(|index| {
+            let bounds = self.scroll_handle.bounds_for_item(index)?;
+            let bounds = Bounds::new(bounds.origin + offset, bounds.size);
+            bounds.contains(&position).then_some((index, bounds))
+        })
+    }
+
     fn hit_test(&self, position: Point<Pixels>) -> Option<Anchor> {
         let PagesState::Rendered(pages) = &self.pages else {
             return None;
         };
-        let (page_index, bounds) = (0..pages.len()).find_map(|index| {
-            let bounds = self.scroll_handle.bounds_for_item(index)?;
-            bounds.contains(&position).then_some((index, bounds))
-        })?;
+        let (page_index, bounds) = self.page_at(pages.len(), position)?;
         let page = pages.get(page_index)?;
         let scale = f32::from(bounds.size.width) / page.width_points;
         if scale <= 0.0 {
@@ -473,15 +661,17 @@ impl PdfView {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
-    fn inverse_search(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+    fn inverse_search(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let PagesState::Rendered(pages) = &self.pages else {
             log::warn!("pdf inverse search: the PDF is not rendered yet");
             return;
         };
-        let Some((index, bounds)) = (0..pages.len()).find_map(|index| {
-            let bounds = self.scroll_handle.bounds_for_item(index)?;
-            bounds.contains(&position).then_some((index, bounds))
-        }) else {
+        let Some((index, bounds)) = self.page_at(pages.len(), position) else {
             log::warn!("pdf inverse search: click {position:?} is outside every page");
             return;
         };
@@ -500,7 +690,10 @@ impl PdfView {
             log::warn!("pdf inverse search: no workspace for this window");
             return;
         };
-        log::info!("pdf inverse search: page {} at ({x:.1}, {y:.1}) pt", index + 1);
+        log::info!(
+            "pdf inverse search: page {} at ({x:.1}, {y:.1}) pt",
+            index + 1
+        );
         let pdf_position = PdfPosition {
             page: index as u32 + 1,
             x,
@@ -543,6 +736,25 @@ impl PdfView {
             .justify_center()
             .border_b_1()
             .border_color(cx.theme().colors().border)
+            .child(ToggleButtonGroup::single_row(
+                "pdf-sidebar-mode",
+                [
+                    ToggleButtonSimple::new(
+                        "Outline",
+                        cx.listener(|this, _, _, cx| {
+                            this.toggle_sidebar(SidebarMode::Outline, cx);
+                        }),
+                    )
+                    .selected(self.sidebar_mode == SidebarMode::Outline),
+                    ToggleButtonSimple::new(
+                        "Thumbnails",
+                        cx.listener(|this, _, _, cx| {
+                            this.toggle_sidebar(SidebarMode::Thumbnails, cx);
+                        }),
+                    )
+                    .selected(self.sidebar_mode == SidebarMode::Thumbnails),
+                ],
+            ))
             .child(
                 IconButton::new("pdf-zoom-out", IconName::Dash)
                     .icon_size(IconSize::Small)
@@ -591,7 +803,7 @@ impl Focusable for PdfView {
 }
 
 impl Render for PdfView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selection = self.selection;
         let highlight = self.highlight;
         let selection_color = cx.theme().colors().text_accent.opacity(0.3);
@@ -604,11 +816,33 @@ impl Render for PdfView {
                 .into_any_element(),
             PagesState::Rendered(pages) => {
                 let display_width = self.display_width();
-                div()
+                let viewport_height = f32::from(self.scroll_handle.bounds().size.height);
+                let max_offset_y = f32::from(self.scroll_handle.max_offset().y);
+                let scrollbar = (viewport_height > 0.0 && max_offset_y > 0.0).then(|| {
+                    let thumb_height = scrollbar_thumb_height(viewport_height, max_offset_y);
+                    let scrolled_ratio =
+                        (-f32::from(self.scroll_handle.offset().y) / max_offset_y).clamp(0.0, 1.0);
+                    let thumb_top = (viewport_height - thumb_height) * scrolled_ratio;
+                    div()
+                        .absolute()
+                        .top(px(thumb_top))
+                        .right_0()
+                        .w(px(SCROLLBAR_WIDTH))
+                        .h(px(thumb_height))
+                        .rounded_full()
+                        .bg(cx.theme().colors().scrollbar_thumb_background)
+                });
+                let sidebar = (self.sidebar_mode != SidebarMode::Hidden)
+                    .then(|| self.render_sidebar(pages, cx));
+                let pages_view = div()
                     .id("pdf-pages")
+                    .relative()
                     .size_full()
                     .overflow_scroll()
                     .track_scroll(&self.scroll_handle)
+                    .on_scroll_wheel(cx.listener(|_, _, _, cx| {
+                        cx.notify();
+                    }))
                     .p_4()
                     .gap_4()
                     .flex()
@@ -634,9 +868,12 @@ impl Render for PdfView {
                         let Some(anchor) = this.drag_anchor else {
                             return;
                         };
-                        this.selection =
-                            this.hit_test(event.position).map(|current| (anchor, current));
-                        cx.notify();
+                        // Positions between pages hit nothing; keeping the last selection
+                        // avoids it flickering off while the drag crosses a gap.
+                        if let Some(current) = this.hit_test(event.position) {
+                            this.selection = Some((anchor, current));
+                            cx.notify();
+                        }
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
@@ -648,8 +885,8 @@ impl Render for PdfView {
                         let height = display_width * page.height_points / page.width_points;
                         let scale = display_width / page.width_points;
                         let mut overlays: Vec<AnyElement> = Vec::new();
-                        if let Some(position) = highlight
-                            .filter(|position| position.page as usize == page_index + 1)
+                        if let Some(position) =
+                            highlight.filter(|position| position.page as usize == page_index + 1)
                         {
                             let left = position.x * scale;
                             let top = position.y * scale;
@@ -681,8 +918,7 @@ impl Render for PdfView {
                                     }
                                     let left = character.left * scale;
                                     let top = character.top * scale;
-                                    let width =
-                                        (character.right - character.left).max(0.0) * scale;
+                                    let width = (character.right - character.left).max(0.0) * scale;
                                     let height =
                                         (character.bottom - character.top).max(0.0) * scale;
                                     overlays.push(
@@ -706,11 +942,61 @@ impl Render for PdfView {
                             .child(img(ImageSource::Render(page.image.clone())).size_full())
                             .children(overlays)
                             .into_any_element()
+                    }));
+                h_flex()
+                    .size_full()
+                    .children(sidebar.map(|sidebar| {
+                        div()
+                            .w(px(SIDEBAR_WIDTH))
+                            .h_full()
+                            .flex_shrink_0()
+                            .border_r_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(sidebar)
                     }))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                                if this.scrollbar_dragging
+                                    && event.pressed_button == Some(MouseButton::Left)
+                                {
+                                    this.scroll_to_pointer(event.position.y, cx);
+                                }
+                            }))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, _cx| {
+                                    this.scrollbar_dragging = false;
+                                }),
+                            )
+                            .child(pages_view)
+                            .children(scrollbar)
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .right_0()
+                                    .w(px(SCROLLBAR_TRACK_WIDTH))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            this.scrollbar_dragging = true;
+                                            this.scroll_to_pointer(event.position.y, cx);
+                                        }),
+                                    ),
+                            ),
+                    )
                     .into_any_element()
             }
         };
         div()
+            .key_context(PDF_VIEWER_KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .size_full()
             .flex()
@@ -786,7 +1072,11 @@ fn forward_search(
     let Some(project_path) = active_item.project_path(cx) else {
         return;
     };
-    let Some(source_path) = workspace.project().read(cx).absolute_path(&project_path, cx) else {
+    let Some(source_path) = workspace
+        .project()
+        .read(cx)
+        .absolute_path(&project_path, cx)
+    else {
         return;
     };
     let cursor = editor.update(cx, |editor, cx| {
